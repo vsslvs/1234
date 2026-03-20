@@ -381,29 +381,40 @@ class PolymarketClient:
     # Approval check (one-time setup)
     # ------------------------------------------------------------------
 
-    async def check_approvals(self) -> None:
+    async def check_approvals(self) -> bool:
         """
         Verify that the exchange contract is approved for USDC and
-        conditional tokens. Log a warning if not — the user must run the
-        one-time approval transaction before the bot can trade.
+        conditional tokens.
+
+        Returns True  if all approvals are in place (safe to trade).
+        Returns True  if the endpoint is unreachable (non-blocking — bot
+                      proceeds and will fail at first order if approvals missing).
+        Returns False if the endpoint explicitly reports missing approvals
+                      (caller should halt trading immediately).
         """
         async with self._session.get(
             "/auth/approvals",
             params={"address": self._maker_address},
         ) as r:
             if r.status != 200:
-                log.warning("Could not check approvals (status %s)", r.status)
-                return
+                log.warning(
+                    "Could not verify approvals (status %s) — proceeding",
+                    r.status,
+                )
+                return True   # endpoint unavailable; don't block startup
             data = await r.json()
 
-        if not data.get("usdcApproved"):
-            log.error(
-                "USDC not approved for exchange contract %s. "
-                "Run the one-time approval before trading.",
-                Config.EXCHANGE_ADDRESS,
+        usdc_ok  = bool(data.get("usdcApproved", False))
+        token_ok = bool(data.get("conditionalTokenApproved", False))
+
+        if not usdc_ok or not token_ok:
+            log.critical(
+                "Exchange contract approvals missing "
+                "(USDC approved=%s, conditional tokens approved=%s). "
+                "Run the one-time approval transaction and restart the bot.",
+                usdc_ok, token_ok,
             )
-        if not data.get("conditionalTokenApproved"):
-            log.error(
-                "Conditional tokens not approved. "
-                "Run the one-time approval before trading.",
-            )
+            return False
+
+        log.info("Exchange approvals verified (USDC ✓, conditional tokens ✓)")
+        return True

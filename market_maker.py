@@ -52,6 +52,12 @@ log = logging.getLogger(__name__)
 
 # Minimum price change to trigger a cancel/replace (avoids churn)
 PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
+
+# Circuit breaker: after this many consecutive place_maker_order failures,
+# pause the quoting loop for _API_CIRCUIT_PAUSE_SEC before retrying.
+_API_ERROR_CIRCUIT_LIMIT = 5
+_API_CIRCUIT_PAUSE_SEC   = 30
+
 # Probability threshold: only quote if signal is this strong.
 # For positive EV buying YES at TARGET_PRICE_YES=0.92 we need p_up > 0.92.
 # Using 0.94 gives ~200 bps expected edge at entry, providing a safety margin.
@@ -122,6 +128,9 @@ class MarketMaker:
         self._running = False
         self._stats   = BotStats()
         self._windows_since_stats_log = 0
+        # Circuit breaker: counts consecutive place_maker_order failures.
+        # Resets to 0 on the next successful placement.
+        self._consecutive_api_errors: int = 0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -131,7 +140,11 @@ class MarketMaker:
         self._running = True
         log.info("MarketMaker starting")
 
-        await self._client.check_approvals()
+        if not await self._client.check_approvals():
+            raise RuntimeError(
+                "Exchange contract approvals are missing — cannot trade. "
+                "Run the one-time approval transaction and restart."
+            )
         await self._refresh_market_list()
 
         # Pre-fetch upcoming markets once, then periodically in background
@@ -179,6 +192,18 @@ class MarketMaker:
         # Exit window: cancel everything and wait for resolution
         if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
             await self._cancel_window(state)
+            return
+
+        # Circuit breaker: pause if the CLOB API is repeatedly failing.
+        # Resets after the pause so the bot can recover automatically.
+        if self._consecutive_api_errors >= _API_ERROR_CIRCUIT_LIMIT:
+            log.warning(
+                "Circuit breaker open: %d consecutive API errors — pausing %ds",
+                self._consecutive_api_errors, _API_CIRCUIT_PAUSE_SEC,
+            )
+            await self._cancel_window(state)
+            self._consecutive_api_errors = 0
+            await asyncio.sleep(_API_CIRCUIT_PAUSE_SEC)
             return
 
         # Only quote during entry window
@@ -314,6 +339,16 @@ class MarketMaker:
     async def _refresh_side(self, side: MarketSide, target_price: float) -> None:
         """Place a new order or cancel/replace if price drifted."""
         if not side.has_order:
+            # Guard: enforce MAX_EXPOSURE_USDC before committing more capital.
+            # Sums USDC locked in all currently open orders for this window.
+            exposure = self._current_exposure_usdc()
+            if exposure + Config.ORDER_SIZE_USDC > Config.MAX_EXPOSURE_USDC:
+                log.warning(
+                    "Exposure limit: %.0f + %.0f > %.0f USDC — skipping %s order",
+                    exposure, Config.ORDER_SIZE_USDC, Config.MAX_EXPOSURE_USDC,
+                    side.side_label,
+                )
+                return
             # Fresh placement
             try:
                 order = await self._client.place_maker_order(
@@ -323,8 +358,10 @@ class MarketMaker:
                     size_usdc=Config.ORDER_SIZE_USDC,
                 )
                 side.order = order
+                self._consecutive_api_errors = 0   # reset circuit breaker on success
             except Exception as exc:
                 log.error("place_maker_order %s failed: %s", side.side_label, exc)
+                self._consecutive_api_errors += 1
         elif side.price_drifted(target_price):
             # Cancel/replace with new price
             t0 = time.monotonic()
@@ -358,6 +395,23 @@ class MarketMaker:
         if self._state:
             await self._cancel_window(self._state)
         await self._client.cancel_all_orders()
+
+    def _current_exposure_usdc(self) -> float:
+        """
+        Sum of USDC locked in all currently open maker orders.
+
+        Used to enforce MAX_EXPOSURE_USDC before each fresh order placement.
+        Only counts orders in the active window — cancel/replace orders are
+        never double-counted because the old order is removed before the
+        new one is tracked (or aborted on cancel failure).
+        """
+        if self._state is None:
+            return 0.0
+        total = 0.0
+        for side in (self._state.yes, self._state.no):
+            if side.order:
+                total += side.order.size_usdc
+        return total
 
     # ------------------------------------------------------------------
     # Background market list refresh (every 10 minutes)
