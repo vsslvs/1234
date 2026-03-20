@@ -40,7 +40,7 @@ asyncio.gather brings total wall-clock time to max(cancel_rtt, place_rtt).
 import asyncio
 import logging
 import time
-from typing import Dict, Optional
+from typing import Optional
 
 from config import Config
 from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
@@ -389,7 +389,7 @@ class MarketMaker:
             tasks.append(self._cancel_side(state.no))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        log.info("Cancelled all orders for window %s", state.market.window_start)
+            log.info("Cancelled %d order(s) for window %s", len(tasks), state.market.window_start)
 
     async def _cancel_all_open(self) -> None:
         if self._state:

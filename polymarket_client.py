@@ -257,7 +257,10 @@ class PolymarketClient:
         }
 
         async with self._session.post("/order", json=payload) as r:
-            body = await r.json()
+            try:
+                body = await r.json()
+            except Exception:
+                body = await r.text()
             if r.status != 200:
                 log.error("place_maker_order failed %s: %s", r.status, body)
                 r.raise_for_status()
@@ -288,7 +291,10 @@ class PolymarketClient:
             if r.status == 200:
                 log.debug("Cancelled order %s", order_id)
                 return True
-            body = await r.json()
+            try:
+                body = await r.json()
+            except Exception:
+                body = await r.text()
             log.warning("cancel_order %s → %s %s", order_id, r.status, body)
             return False
 
