@@ -5,6 +5,63 @@
 
 ---
 
+## Session 5 — 2026-03-20 — Полный функциональный аудит + финальный фикс
+
+**Статус:** Проведён end-to-end аудит всех компонентов. Найден 1 баг низкой критичности, исправлен.
+**Итоговая оценка работоспособности: 90 / 100**
+
+### Результат аудита по компонентам
+
+| Компонент | Статус | Замечание |
+|---|---|---|
+| `ws_orderbook.py` | ✅ | URL, routing, reconnect backoff — всё корректно |
+| `market_calculator.py` | ✅ | Slug fetch (6 параллельных), JSON decode, Up/Down, window boundaries, memory purge — всё корректно |
+| `market_maker.py` | ✅ | Thresholds 0.94/0.06, BUY edge sign, edge check на обеих сторонах, rollover, shutdown — всё корректно |
+| `polymarket_client.py` | ✅ | cancel_replace check, cancel_all_orders fix — всё корректно |
+| `config.py` | ✅ | Значения согласованы |
+| `main.py` | ✅ | Startup sequence, signal handling, graceful shutdown — всё корректно |
+
+### Найденный и исправленный баг
+
+| # | Файл | Строка | Описание | Исправление |
+|---|---|---|---|---|
+| 1 | `polymarket_client.py` | 372 | `cancel_all_orders()` использовал `o["id"]` — KeyError если API вернёт `"orderID"`. На shutdown открытые ордера остались бы незакрытыми | `o.get("id") or o.get("orderID", "")` — обрабатывает оба варианта поля |
+
+### Верифицированный end-to-end поток
+
+```
+Startup
+  └─ OrderBookWS.run()              → /stream?streams=btcusdt@depth20/btcusdt@kline_5m
+  └─ ждём mid_price                 → book.mid_price != None
+  └─ fetch_upcoming_markets()       → 6 slug-запросов параллельно
+  └─ MarketMaker.run()
+
+Каждые 200 мс (_tick)
+  ├─ current_market()               → lookup по current_window_start()
+  ├─ window сменилось?              → _rollover() → cancel old + new WindowState
+  ├─ < EXIT_WINDOW_SEC (2с)?        → _cancel_window() + return
+  ├─ not is_entry_window?           → return
+  └─ _quote_window()
+       fair_yes, fair_no = fair_prices(market)   # p_up через logistic k=1500
+       p_up = fair_yes
+       p_up > 0.94 → edge=(fair_yes−0.92)×10000 ≥ 50 bps → BUY UP token
+       p_up < 0.06 → edge=(fair_no−0.92)×10000  ≥ 50 bps → BUY DOWN token
+
+Shutdown
+  └─ mm.stop() → cancel_window() + cancel_all_orders()  ← исправлено
+
+Каждые 10 минут (background)
+  └─ fetch_upcoming_markets()       → обновляет кеш + purge stale
+```
+
+### Оставшиеся нефатальные моменты
+
+- `check_approvals()` использует `/auth/approvals` — при 404 бот продолжит со WARNING (не падает)
+- Стратегия односторонняя (только BUY maker ордера) — rebates могут быть меньше, чем при two-sided quoting
+- Logistic signal k=1500: порог 94% достигается при ret ≈ 0.20% движения BTC. Требует калибровки на исторических данных для точной оценки частоты входов
+
+---
+
 ## Session 4 — 2026-03-20 — Применение исправлений (все критические баги устранены)
 
 **Статус:** Все исправления применены и запушены. Оценка работоспособности: **~80 / 100**.

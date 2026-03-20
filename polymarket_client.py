@@ -369,7 +369,10 @@ class PolymarketClient:
         orders = await self.get_open_orders()
         if not orders:
             return
-        tasks = [self.cancel_order(o["id"]) for o in orders]
+        tasks = [
+            self.cancel_order(o.get("id") or o.get("orderID", ""))
+            for o in orders
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         cancelled = sum(1 for r in results if r is True)
         log.info("Cancelled %d / %d open orders on shutdown", cancelled, len(orders))
