@@ -43,8 +43,9 @@ import time
 from typing import Dict, Optional
 
 from config import Config
-from market_calculator import BtcMarket, MarketCalculator
+from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
+from stats import BotStats
 from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
@@ -62,9 +63,15 @@ class MarketSide:
     """Holds the live maker order for one side (YES or NO) of one market."""
 
     def __init__(self, token_id: str, side_label: str):
-        self.token_id = token_id
+        self.token_id   = token_id
         self.side_label = side_label  # "YES" or "NO"
         self.order: Optional[MakerOrder] = None
+
+        # Stats fields — survive order cancellation so _evaluate_and_record_window
+        # can read them at rollover time even after EXIT_WINDOW cancel.
+        self.was_ever_active:    bool  = False   # True if an order was placed this window
+        self.p_signal_at_entry:  float = 0.0     # logistic p when first order was placed
+        self.last_entry_price:   float = 0.0     # price of first order this window
 
     @property
     def has_order(self) -> bool:
@@ -108,11 +115,13 @@ class MarketMaker:
         calc: MarketCalculator,
         ob_ws: OrderBookWS,
     ):
-        self._client = client
-        self._calc = calc
-        self._ob_ws = ob_ws
-        self._state: Optional[WindowState] = None
+        self._client  = client
+        self._calc    = calc
+        self._ob_ws   = ob_ws
+        self._state:  Optional[WindowState] = None
         self._running = False
+        self._stats   = BotStats()
+        self._windows_since_stats_log = 0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -140,6 +149,14 @@ class MarketMaker:
 
     async def stop(self) -> None:
         self._running = False
+        self._stats.log_summary(
+            k=K_SIGNAL,
+            entry_window_sec=Config.ENTRY_WINDOW_SEC,
+            market_window_sec=Config.MARKET_WINDOW_SEC,
+            threshold=P_UP_THRESHOLD,
+            entry_price=Config.TARGET_PRICE_YES,
+            size_usdc=Config.ORDER_SIZE_USDC,
+        )
         await self._cancel_all_open()
 
     # ------------------------------------------------------------------
@@ -171,10 +188,24 @@ class MarketMaker:
         await self._quote_window(state, market)
 
     async def _rollover(self, new_market: BtcMarket) -> None:
-        """Clean up old window orders, set up new window state."""
+        """Clean up old window, evaluate its outcome, set up new window state."""
         if self._state:
+            # Evaluate BEFORE cancel so was_ever_active / entry fields are intact
+            self._evaluate_and_record_window(self._state)
             log.info("Window rolled over — cancelling old orders")
             await self._cancel_window(self._state)
+
+            self._windows_since_stats_log += 1
+            if self._windows_since_stats_log >= Config.STATS_LOG_INTERVAL:
+                self._windows_since_stats_log = 0
+                self._stats.log_summary(
+                    k=K_SIGNAL,
+                    entry_window_sec=Config.ENTRY_WINDOW_SEC,
+                    market_window_sec=Config.MARKET_WINDOW_SEC,
+                    threshold=P_UP_THRESHOLD,
+                    entry_price=Config.TARGET_PRICE_YES,
+                    size_usdc=Config.ORDER_SIZE_USDC,
+                )
 
         self._state = WindowState(new_market)
         log.info(
@@ -185,6 +216,20 @@ class MarketMaker:
 
     async def _quote_window(self, state: WindowState, market: BtcMarket) -> None:
         """Place or refresh maker orders based on directional signal."""
+        # --- Volatility gate -------------------------------------------
+        # Skip trading if the recent Binance 5-minute candle range is extreme.
+        # A high-low range > VOLATILITY_GATE_BPS signals a flash-crash, major
+        # news event, or severely illiquid conditions where the random-walk model
+        # breaks down and EV can turn negative.
+        candle_vol = self._ob_ws.candle.volatility_bps
+        if candle_vol > Config.VOLATILITY_GATE_BPS:
+            log.debug(
+                "Vol gate: window=%d  candle_vol=%.0f bps > gate=%.0f bps — skip",
+                state.market.window_start, candle_vol, Config.VOLATILITY_GATE_BPS,
+            )
+            await self._cancel_window(state)
+            return
+
         # fair_prices() calls p_up_signal() internally — no duplicate call needed.
         # fair_prices returns (p_up, 1-p_up), so fair_yes == p_up by definition.
         fair_yes, fair_no = self._calc.fair_prices(market)
@@ -199,6 +244,11 @@ class MarketMaker:
             # Positive means we are buying BELOW our estimated fair value.
             edge = (fair_yes - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
+                # Record entry stats on the FIRST order of this window only
+                if not state.yes.was_ever_active:
+                    state.yes.p_signal_at_entry = p_up
+                    state.yes.last_entry_price  = target
+                    state.yes.was_ever_active   = True
                 tasks.append(self._refresh_side(state.yes, target))
         else:
             if state.yes.has_order:
@@ -210,6 +260,10 @@ class MarketMaker:
             # BUY edge for NO: (fair_no - target) × 10000
             edge = (fair_no - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
+                if not state.no.was_ever_active:
+                    state.no.p_signal_at_entry = p_up
+                    state.no.last_entry_price  = target
+                    state.no.was_ever_active   = True
                 tasks.append(self._refresh_side(state.no, target))
         else:
             if state.no.has_order:
@@ -217,6 +271,41 @@ class MarketMaker:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _evaluate_and_record_window(self, state: WindowState) -> None:
+        """
+        Approximate trade outcome for the closing window and record it.
+
+        Resolution approximation:
+          actual_up = (Binance mid at rollover) >= (window open price)
+        This proxies the Chainlink oracle resolution.  Correlation between
+        Binance and Chainlink BTC/USD is >99.9% on 5-minute scales.
+
+        We record only sides that were ever active (had an order placed).
+        The stats fields (was_ever_active, p_signal_at_entry, last_entry_price)
+        survive the EXIT_WINDOW cancel, so they are readable here at rollover.
+        """
+        market = state.market
+        mid    = self._ob_ws.book.mid_price
+        if mid is None or market.open_price is None:
+            return  # no price data — skip recording for this window
+
+        btc_closed_up = mid >= market.open_price
+
+        for side in (state.yes, state.no):
+            if not side.was_ever_active:
+                continue
+            # YES token wins if BTC closed up; NO token wins if BTC closed down
+            signal_is_up = (side.side_label == "YES")
+            won = (btc_closed_up == signal_is_up)
+            self._stats.record_trade(
+                window_start=market.window_start,
+                side=side.side_label,
+                entry_price=side.last_entry_price,
+                size_usdc=Config.ORDER_SIZE_USDC,
+                p_signal=side.p_signal_at_entry,
+                won=won,
+            )
 
     # ------------------------------------------------------------------
     # Order helpers

@@ -41,6 +41,26 @@ log = logging.getLogger(__name__)
 GAMMA_API = "https://gamma-api.polymarket.com"
 WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 
+# Logistic signal steepness.  Maps BTC return at entry → win probability.
+#
+# Calibration (random-walk model):
+#   σ₅    = 0.22%   (BTC 5-min vol: 60% annual → 5-min window)
+#   σ_rem = σ₅ × √(ENTRY_WINDOW_SEC / WINDOW_SEC)
+#         = 0.22% × √(10/300) = 0.040%
+#
+#   For p=0.94 to equal true P at entry:
+#     k_exact  = logit(0.94) / (Φ⁻¹(0.94) × σ_rem) = 2.75 / (1.555×0.040%) ≈ 4 421
+#
+#   k_safe = 2 000 chosen for robustness up to σ₅=0.50% (high-vol day).
+#   VOLATILITY_GATE_BPS=200 blocks windows where σ₅ > 0.70%,
+#   ensuring positive EV (actual P > break-even 0.92) across all traded windows.
+#
+#   Win rates with k=2000, threshold=0.94:
+#     σ₅ = 0.22% → P = 99.97%  (typical day)
+#     σ₅ = 0.50% → P = 93.6%   (high-vol,  EV > 0)
+#     σ₅ > 0.70% → not traded  (VOLATILITY_GATE blocks)
+K_SIGNAL: float = 2000.0
+
 
 @dataclass
 class BtcMarket:
@@ -266,9 +286,7 @@ class MarketCalculator:
             return 0.5
 
         ret = (mid - market.open_price) / market.open_price
-        # logistic: k=1500 gives ~85% at ret=0.3%
-        k = 1500.0
-        p_up = 1.0 / (1.0 + math.exp(-k * ret))
+        p_up = 1.0 / (1.0 + math.exp(-K_SIGNAL * ret))
         return p_up
 
     def fair_prices(self, market: BtcMarket) -> tuple[float, float]:

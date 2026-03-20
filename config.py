@@ -45,6 +45,16 @@ class Config:
     # Risk
     MAX_EXPOSURE_USDC: float = _get("MAX_EXPOSURE_USDC", "500", float)
 
+    # Volatility gate: skip trading if the latest 5-minute Binance candle
+    # high-low range exceeds this threshold (basis points, relative to close).
+    # 200 bps = 2% range.  At σ₅ = 0.22% typical, a 2% range represents
+    # ~3× normal volatility and signals flash-crash / news event conditions
+    # where the random-walk model breaks down and EV turns negative.
+    VOLATILITY_GATE_BPS: float = _get("VOLATILITY_GATE_BPS", "200", float)
+
+    # Log a statistics summary every N window rollovers (≈ every N × 5 minutes).
+    STATS_LOG_INTERVAL: int = _get("STATS_LOG_INTERVAL", "10", int)
+
     # 5-minute BTC markets: 288 per day, each window = 300 seconds
     MARKET_WINDOW_SEC: int = 300
     MARKETS_PER_DAY: int = 288
