@@ -1,6 +1,5 @@
 """
-Configuration loader for BTC market maker bot.
-All values sourced from environment / .env file.
+Configuration loader for Polymarket BTC 5-minute market maker bot.
 """
 import os
 from dotenv import load_dotenv
@@ -16,33 +15,44 @@ def _get(key: str, default=None, cast=str):
 
 
 class Config:
-    # Credentials
-    API_KEY: str = _get("BINANCE_API_KEY")
-    API_SECRET: str = _get("BINANCE_API_SECRET")
+    # Wallet
+    PRIVATE_KEY: str = _get("POLYMARKET_PRIVATE_KEY")
+
+    # Endpoints
+    CLOB_API_URL: str = _get("CLOB_API_URL", "https://clob.polymarket.com")
+    CLOB_WS_URL: str = _get("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/")
+    BINANCE_WS_URL: str = _get("BINANCE_WS_URL", "wss://stream.binance.com:9443/ws")
 
     # Market
-    SYMBOL: str = _get("SYMBOL", "BTCUSDT")
+    BTC_SYMBOL: str = _get("BTC_SYMBOL", "BTCUSDT")
 
-    # Sizing
-    ORDER_SIZE_QUOTE: float = _get("ORDER_SIZE_QUOTE", "50", float)
-    MIN_ORDER_SIZE_BTC: float = _get("MIN_ORDER_SIZE_BTC", "0.0001", float)
-    MAX_POSITION_USDT: float = _get("MAX_POSITION_USDT", "500", float)
+    # Sizing (USDC has 6 decimal places on Polygon)
+    ORDER_SIZE_USDC: float = _get("ORDER_SIZE_USDC", "50", float)
+    ORDER_SIZE_RAW: int = int(_get("ORDER_SIZE_USDC", "50", float) * 1_000_000)
+    MAX_OPEN_ORDERS: int = _get("MAX_OPEN_ORDERS", "4", int)
 
     # Pricing
-    SPREAD_BPS: int = _get("SPREAD_BPS", "20", int)
-    FEE_RATE_BPS: int = _get("FEE_RATE_BPS", "10", int)
-    MAX_SPREAD_DEVIATION_BPS: int = _get("MAX_SPREAD_DEVIATION_BPS", "50", int)
+    TARGET_PRICE_YES: float = _get("TARGET_PRICE_YES", "0.92", float)
+    TARGET_PRICE_NO: float = _get("TARGET_PRICE_NO", "0.92", float)
+    MIN_EDGE_BPS: int = _get("MIN_EDGE_BPS", "50", int)
 
-    # Timing (convert ms -> seconds where needed)
-    REBALANCE_INTERVAL_SEC: int = _get("REBALANCE_INTERVAL_SEC", "300", int)
-    QUOTE_REFRESH_MS: int = _get("QUOTE_REFRESH_MS", "500", int)
+    # Timing (ms)
+    QUOTE_REFRESH_MS: int = _get("QUOTE_REFRESH_MS", "200", int)
     CANCEL_REPLACE_TIMEOUT_MS: int = _get("CANCEL_REPLACE_TIMEOUT_MS", "90", int)
+    ENTRY_WINDOW_SEC: int = _get("ENTRY_WINDOW_SEC", "10", int)
+    EXIT_WINDOW_SEC: int = _get("EXIT_WINDOW_SEC", "2", int)
 
-    # WebSocket endpoints
-    WS_BASE: str = "wss://stream.binance.com:9443/ws"
-    REST_BASE: str = "https://api.binance.com"
+    # Risk
+    MAX_EXPOSURE_USDC: float = _get("MAX_EXPOSURE_USDC", "500", float)
 
-    # Derived: total minimum spread = 2x fee to break even + configured base
-    @classmethod
-    def min_spread_bps(cls) -> int:
-        return cls.FEE_RATE_BPS * 2 + cls.SPREAD_BPS
+    # 5-minute BTC markets: 288 per day, each window = 300 seconds
+    MARKET_WINDOW_SEC: int = 300
+    MARKETS_PER_DAY: int = 288
+
+    # Polygon chain ID (Polymarket runs on Polygon PoS)
+    CHAIN_ID: int = 137
+
+    # CLOB contract addresses (mainnet)
+    EXCHANGE_ADDRESS: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+    CONDITIONAL_TOKEN_ADDRESS: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    USDC_ADDRESS: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon

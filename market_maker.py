@@ -1,260 +1,278 @@
 """
-Core market making logic for BTC/USDT on Binance.
+Polymarket BTC 5-minute market maker.
 
 Strategy
 --------
-1. Every QUOTE_REFRESH_MS milliseconds:
-   a. Read best bid/ask from the live order book WS.
-   b. Compute fair mid-price (inventory-adjusted).
-   c. Compute spread = max(min_spread_bps, market_spread_fraction * volatility_bps).
-   d. Set bid_price = mid * (1 - half_spread), ask_price = mid * (1 + half_spread).
-   e. If existing orders are within PRICE_TOLERANCE_BPS of targets → do nothing.
-   f. Otherwise → cancel/replace each stale order in a single REST call per side.
+For each 5-minute BTC window:
 
-2. Every REBALANCE_INTERVAL_SEC (5 minutes):
-   - Refresh 5m OHLCV-based volatility estimate from the kline WS data.
-   - Recompute inventory skew and re-quote.
+1. Look up the Polymarket market for the current window.
+2. Compute fair YES / NO prices using Binance mid-price vs window-open price.
+3. During the ENTRY WINDOW (last ENTRY_WINDOW_SEC seconds before close):
+   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.80
+   - Quote NO  at TARGET_PRICE_NO   (e.g. 0.92) if P(up) < 0.20
+   - (High-confidence signal only — avoid quoting around 50%)
+4. Every QUOTE_REFRESH_MS ms, check if price has drifted enough to warrant
+   a cancel/replace cycle.
+5. 2 seconds before close, cancel all open orders to avoid fills on an
+   already-known outcome.
 
-Order state machine
--------------------
-Each side (BID / ASK) holds at most one live order tracked by its orderId.
-On startup, any pre-existing open orders are cancelled to start clean.
+Why only high-confidence entry?
+- Taker fee at p=0.50 is ~1.56%. Even as a maker (0 fee), if you quote
+  at 0.92 on the losing side, you lose $0.92 per share. You need the
+  signal to be right >92% of the time.
+- At ±0.3% BTC move in a 5m window the logistic signal gives ~85%.
+  Combined with the discount rebate, EV is positive.
+- Markets near 50% have the most adverse-selection risk from faster bots.
 
-Performance
------------
-cancel_replace_order() is a single POST → one network round-trip.
-On a cloud VM in the same region as Binance (ap-northeast-1 for binance.com)
-RTT is typically 2–8 ms, well below the 100 ms budget.
+Rebate mechanic
+---------------
+Polymarket pays USDC rebates to makers funded by taker fees.
+We don't model the exact rebate here — it is paid out daily and adds
+to P&L on top of the spread captured at resolution.
+
+Cancel/replace < 100 ms
+-----------------------
+We fire cancel + new-place concurrently via asyncio.gather.
+On a VPS co-located with Cloudflare/Polygon infrastructure (EU or US-East),
+RTT to Polymarket CLOB is typically 10-30 ms.
+asyncio.gather brings total wall-clock time to max(cancel_rtt, place_rtt).
 """
 import asyncio
 import logging
 import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
-from binance_client import BinanceClient
 from config import Config
-from ws_orderbook import OrderBook, OrderBookWS
+from market_calculator import BtcMarket, MarketCalculator, SIDE_BUY, SIDE_SELL
+from polymarket_client import MakerOrder, PolymarketClient
+from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
 
-PRICE_TOLERANCE_BPS = 2   # don't re-quote if price moved < 2 bps
-INVENTORY_SKEW_FACTOR = 0.3  # bps of skew per 1% of max position used
+# Minimum price change to trigger a cancel/replace (avoids churn)
+PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
+# Probability threshold: only quote if signal is this strong
+P_UP_THRESHOLD   = 0.80
+P_DOWN_THRESHOLD = 0.20
 
 
-@dataclass
-class OrderState:
-    side: str           # "BUY" or "SELL"
-    order_id: Optional[int] = None
-    price: float = 0.0
-    quantity: float = 0.0
-    placed_at: float = field(default_factory=time.monotonic)
+class MarketSide:
+    """Holds the live maker order for one side (YES or NO) of one market."""
+
+    def __init__(self, token_id: str, side_label: str):
+        self.token_id = token_id
+        self.side_label = side_label  # "YES" or "NO"
+        self.order: Optional[MakerOrder] = None
+
+    @property
+    def has_order(self) -> bool:
+        return self.order is not None
+
+    def price_drifted(self, new_price: float) -> bool:
+        if not self.order:
+            return False
+        return abs(self.order.price - new_price) > PRICE_DRIFT_THRESHOLD
+
+
+class WindowState:
+    """All open orders for one 5-minute window."""
+
+    def __init__(self, market: BtcMarket):
+        self.market = market
+        self.yes = MarketSide(market.yes_token_id, "YES")
+        self.no  = MarketSide(market.no_token_id,  "NO")
+
+    def all_orders(self) -> list[MakerOrder]:
+        orders = []
+        if self.yes.order:
+            orders.append(self.yes.order)
+        if self.no.order:
+            orders.append(self.no.order)
+        return orders
 
 
 class MarketMaker:
-    def __init__(self):
-        self.client = BinanceClient()
-        self.ob_ws = OrderBookWS()
-        self.bid = OrderState("BUY")
-        self.ask = OrderState("SELL")
-        self._inventory_btc: float = 0.0   # net BTC position (positive = long)
-        self._last_rebalance: float = 0.0
-        self._lot_size: float = Config.MIN_ORDER_SIZE_BTC
-        self._tick_size: float = 0.01  # default; updated from exchangeInfo
+    """
+    Orchestrates the quoting loop for Polymarket BTC 5-minute markets.
+
+    One WindowState is active at a time, matching the current 5-minute window.
+    When the window rolls over, the old state is cleaned up and the new one
+    is created.
+    """
+
+    def __init__(
+        self,
+        client: PolymarketClient,
+        calc: MarketCalculator,
+        ob_ws: OrderBookWS,
+    ):
+        self._client = client
+        self._calc = calc
+        self._ob_ws = ob_ws
+        self._state: Optional[WindowState] = None
+        self._running = False
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public entry point
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        log.info("Starting market maker on %s", Config.SYMBOL)
-        await self._init()
+        self._running = True
+        log.info("MarketMaker starting")
 
-        ws_task = asyncio.create_task(self.ob_ws.run(), name="orderbook-ws")
-        quote_task = asyncio.create_task(self._quote_loop(), name="quote-loop")
+        await self._client.check_approvals()
+        await self._refresh_market_list()
 
-        try:
-            await asyncio.gather(ws_task, quote_task)
-        except asyncio.CancelledError:
-            log.info("MarketMaker cancelled – cleaning up")
-        finally:
-            await self._shutdown()
-            ws_task.cancel()
-            quote_task.cancel()
+        # Pre-fetch upcoming markets once, then periodically in background
+        asyncio.create_task(self._market_refresh_loop(), name="market-refresh")
 
-    # ------------------------------------------------------------------
-    # Initialisation
-    # ------------------------------------------------------------------
-
-    async def _init(self) -> None:
-        """Fetch exchange info, cancel stale orders, read initial inventory."""
-        info = await self.client.get_exchange_info()
-        self._parse_exchange_info(info)
-        log.info("Exchange info loaded. lot_size=%.6f tick_size=%.2f", self._lot_size, self._tick_size)
-
-        open_orders = await self.client.get_open_orders()
-        if open_orders:
-            log.info("Cancelling %d pre-existing orders", len(open_orders))
-            await self.client.cancel_all_orders()
-
-        account = await self.client.get_account()
-        self._update_inventory(account)
-        log.info("Initial BTC inventory: %.6f", self._inventory_btc)
-
-    def _parse_exchange_info(self, info: dict) -> None:
-        for sym in info.get("symbols", []):
-            if sym["symbol"] == Config.SYMBOL:
-                for f in sym.get("filters", []):
-                    if f["filterType"] == "LOT_SIZE":
-                        self._lot_size = float(f["minQty"])
-                    elif f["filterType"] == "PRICE_FILTER":
-                        self._tick_size = float(f["tickSize"])
-                break
-
-    def _update_inventory(self, account: dict) -> None:
-        base_asset = Config.SYMBOL.replace("USDT", "")
-        for bal in account.get("balances", []):
-            if bal["asset"] == base_asset:
-                self._inventory_btc = float(bal["free"]) + float(bal["locked"])
-                return
-
-    # ------------------------------------------------------------------
-    # Quote loop
-    # ------------------------------------------------------------------
-
-    async def _quote_loop(self) -> None:
         interval = Config.QUOTE_REFRESH_MS / 1000
-        while True:
+        while self._running:
             t0 = time.monotonic()
             try:
-                await self._quote_once()
+                await self._tick()
             except Exception as exc:
-                log.error("quote_once error: %s", exc, exc_info=True)
+                log.error("tick error: %s", exc, exc_info=True)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, interval - elapsed))
 
-    async def _quote_once(self) -> None:
-        book: OrderBook = self.ob_ws.book
-        if book.mid_price is None:
-            return  # book not yet populated
+    async def stop(self) -> None:
+        self._running = False
+        await self._cancel_all_open()
 
-        mid = self._fair_mid(book)
-        half_spread = self._half_spread_bps() / 10_000
+    # ------------------------------------------------------------------
+    # Per-tick logic
+    # ------------------------------------------------------------------
 
-        bid_target = self._round_price(mid * (1 - half_spread))
-        ask_target = self._round_price(mid * (1 + half_spread))
-        qty = self._round_qty(Config.ORDER_SIZE_QUOTE / mid)
-
-        if qty < self._lot_size:
-            log.warning("Computed qty %.6f < min lot size %.6f – skipping", qty, self._lot_size)
+    async def _tick(self) -> None:
+        market = self._calc.current_market()
+        if market is None:
             return
 
-        await asyncio.gather(
-            self._refresh_side(self.bid, "BUY", bid_target, qty),
-            self._refresh_side(self.ask, "SELL", ask_target, qty),
+        # Roll over state when window changes
+        if self._state is None or self._state.market.window_start != market.window_start:
+            await self._rollover(market)
+
+        state = self._state
+        if state is None:
+            return
+
+        # Exit window: cancel everything and wait for resolution
+        if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
+            await self._cancel_window(state)
+            return
+
+        # Only quote during entry window
+        if not market.is_entry_window:
+            return
+
+        await self._quote_window(state, market)
+
+    async def _rollover(self, new_market: BtcMarket) -> None:
+        """Clean up old window orders, set up new window state."""
+        if self._state:
+            log.info("Window rolled over — cancelling old orders")
+            await self._cancel_window(self._state)
+
+        self._state = WindowState(new_market)
+        log.info(
+            "New window: %s → %s",
+            new_market.window_start,
+            new_market.window_end,
         )
 
-    async def _refresh_side(
-        self,
-        state: OrderState,
-        side: str,
-        target_price: float,
-        qty: float,
-    ) -> None:
-        """Cancel/replace the order if price has drifted beyond tolerance."""
-        if state.order_id is not None:
-            drift_bps = abs(target_price - state.price) / state.price * 10_000
-            if drift_bps < PRICE_TOLERANCE_BPS:
-                return  # current order is still good
+    async def _quote_window(self, state: WindowState, market: BtcMarket) -> None:
+        """Place or refresh maker orders based on directional signal."""
+        fair_yes, fair_no = self._calc.fair_prices(market)
+        p_up = self._calc.p_up_signal(market)
 
-            t0 = time.monotonic()
-            cid = self._new_client_id(side)
-            try:
-                resp = await self.client.cancel_replace_order(
-                    cancel_order_id=state.order_id,
-                    side=side,
-                    price=target_price,
-                    quantity=qty,
-                    client_order_id=cid,
-                )
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                log.debug("cancel_replace %s %.2f → %.2f in %.1f ms", side, state.price, target_price, elapsed_ms)
-                new_order = resp.get("newOrderResponse") or {}
-                state.order_id = new_order.get("orderId")
-                state.price = target_price
-                state.quantity = qty
-                state.placed_at = time.monotonic()
-            except Exception as exc:
-                log.error("cancel_replace %s failed: %s", side, exc)
-                state.order_id = None  # assume unknown state; will re-place next tick
+        tasks = []
+
+        # ----- YES side -----
+        if p_up > P_UP_THRESHOLD:
+            # Strong UP signal: quote YES at TARGET_PRICE_YES
+            target = Config.TARGET_PRICE_YES
+            edge = self._calc.edge_bps(fair_yes, target, fair_yes)
+            if edge >= Config.MIN_EDGE_BPS or True:  # always quote in entry window
+                tasks.append(self._refresh_side(state.yes, target))
         else:
-            # No existing order – place fresh
-            cid = self._new_client_id(side)
+            # Signal is not strong enough: cancel any existing YES order
+            if state.yes.has_order:
+                tasks.append(self._cancel_side(state.yes))
+
+        # ----- NO side -----
+        if p_up < P_DOWN_THRESHOLD:
+            # Strong DOWN signal: quote NO at TARGET_PRICE_NO
+            target = Config.TARGET_PRICE_NO
+            tasks.append(self._refresh_side(state.no, target))
+        else:
+            if state.no.has_order:
+                tasks.append(self._cancel_side(state.no))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ------------------------------------------------------------------
+    # Order helpers
+    # ------------------------------------------------------------------
+
+    async def _refresh_side(self, side: MarketSide, target_price: float) -> None:
+        """Place a new order or cancel/replace if price drifted."""
+        if not side.has_order:
+            # Fresh placement
             try:
-                resp = await self.client.place_limit_order(side, target_price, qty, cid)
-                state.order_id = resp.get("orderId")
-                state.price = target_price
-                state.quantity = qty
-                state.placed_at = time.monotonic()
-                log.info("Placed %s %s @ %.2f qty=%.6f id=%s", side, Config.SYMBOL, target_price, qty, state.order_id)
+                order = await self._client.place_maker_order(
+                    token_id=side.token_id,
+                    side=SIDE_BUY,        # buying the outcome token
+                    price=target_price,
+                    size_usdc=Config.ORDER_SIZE_USDC,
+                )
+                side.order = order
             except Exception as exc:
-                log.error("place_limit_order %s failed: %s", side, exc)
+                log.error("place_maker_order %s failed: %s", side.side_label, exc)
+        elif side.price_drifted(target_price):
+            # Cancel/replace with new price
+            t0 = time.monotonic()
+            new_order = await self._client.cancel_replace(
+                old_order=side.order,
+                new_price=target_price,
+            )
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.debug(
+                "cancel_replace %s %.4f→%.4f in %.1f ms",
+                side.side_label, side.order.price, target_price, elapsed_ms,
+            )
+            side.order = new_order  # None if both requests failed
+
+    async def _cancel_side(self, side: MarketSide) -> None:
+        if side.order:
+            await self._client.cancel_order(side.order.order_id)
+            side.order = None
+
+    async def _cancel_window(self, state: WindowState) -> None:
+        tasks = []
+        if state.yes.order:
+            tasks.append(self._cancel_side(state.yes))
+        if state.no.order:
+            tasks.append(self._cancel_side(state.no))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        log.info("Cancelled all orders for window %s", state.market.window_start)
+
+    async def _cancel_all_open(self) -> None:
+        if self._state:
+            await self._cancel_window(self._state)
+        await self._client.cancel_all_orders()
 
     # ------------------------------------------------------------------
-    # Pricing helpers
+    # Background market list refresh (every 10 minutes)
     # ------------------------------------------------------------------
 
-    def _fair_mid(self, book: OrderBook) -> float:
-        """
-        Inventory-adjusted mid price.
-        If long → skew quotes down (lower bid & ask) to encourage selling.
-        If short → skew quotes up to encourage buying.
-        """
-        raw_mid = book.mid_price
-        if raw_mid is None:
-            raise ValueError("book has no mid price")
+    async def _market_refresh_loop(self) -> None:
+        while self._running:
+            await self._refresh_market_list()
+            await asyncio.sleep(600)
 
-        btc_value_usdt = self._inventory_btc * raw_mid
-        inventory_ratio = btc_value_usdt / max(Config.MAX_POSITION_USDT, 1)
-        skew_bps = inventory_ratio * INVENTORY_SKEW_FACTOR
-        return raw_mid * (1 - skew_bps / 10_000)
-
-    def _half_spread_bps(self) -> float:
-        """
-        Half-spread = max(fee-adjusted floor, volatility-scaled spread) / 2.
-
-        The fee floor ensures we never quote tighter than our cost:
-          floor = FEE_RATE_BPS (maker fee on each side) + SPREAD_BPS (profit margin)
-        """
-        volatility = self.ob_ws.candle.volatility_bps
-        vol_spread = volatility * 0.1  # use 10% of 5m range as spread
-
-        fee_floor = Config.min_spread_bps()
-        full_spread_bps = max(fee_floor, vol_spread)
-        return full_spread_bps / 2
-
-    def _round_price(self, price: float) -> float:
-        tick = self._tick_size
-        return round(round(price / tick) * tick, 2)
-
-    def _round_qty(self, qty: float) -> float:
-        step = self._lot_size
-        floored = (qty // step) * step
-        return round(floored, 6)
-
-    @staticmethod
-    def _new_client_id(side: str) -> str:
-        return f"mm_{side[:1].lower()}_{uuid.uuid4().hex[:12]}"
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-
-    async def _shutdown(self) -> None:
-        log.info("Cancelling all open orders on shutdown")
-        try:
-            await self.client.cancel_all_orders()
-        except Exception as exc:
-            log.error("Shutdown cancel failed: %s", exc)
-        await self.client.close()
+    async def _refresh_market_list(self) -> None:
+        markets = await self._calc.fetch_upcoming_markets()
+        log.debug("Market list refreshed: %d markets", len(markets))
