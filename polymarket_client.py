@@ -266,6 +266,8 @@ class PolymarketClient:
                 r.raise_for_status()
 
         order_id = body.get("orderID", body.get("id", ""))
+        if not order_id:
+            raise ValueError(f"API returned no order ID in response: {body}")
         log.info(
             "Placed %s order id=%s token=%s price=%.4f size=%.2f fee=%dbps",
             "BUY" if side == SIDE_BUY else "SELL",

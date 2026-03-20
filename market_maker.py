@@ -374,7 +374,13 @@ class MarketMaker:
                 "cancel_replace %s %.4f→%.4f in %.1f ms",
                 side.side_label, side.order.price, target_price, elapsed_ms,
             )
-            side.order = new_order  # None if both requests failed
+            if new_order is not None:
+                side.order = new_order
+                self._consecutive_api_errors = 0
+            # else: keep side.order unchanged — old order may still be live
+            # on the exchange if the cancel failed.  Keeping the reference
+            # ensures the next tick retries the cancel/replace instead of
+            # placing a fresh order (which would cause double exposure).
 
     async def _cancel_side(self, side: MarketSide) -> None:
         if side.order:

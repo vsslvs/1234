@@ -290,6 +290,9 @@ class MarketCalculator:
             candle_open = self._ob_ws.candle.open
             market.open_price = candle_open if candle_open > 0 else mid
 
+        if market.open_price is None or market.open_price <= 0:
+            return 0.5
+
         ret = (mid - market.open_price) / market.open_price
         p_up = 1.0 / (1.0 + math.exp(-K_SIGNAL * ret))
         return p_up

@@ -85,20 +85,19 @@ async def _main() -> None:
                 loop.add_signal_handler(sig, _handle_signal, sig)
 
             mm_task = asyncio.create_task(mm.run(), name="market-maker")
+            stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
 
             await asyncio.wait(
-                [mm_task, asyncio.create_task(stop_event.wait())],
+                [mm_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
+            stop_task.cancel()
             log.info("Stopping — cancelling all open orders")
             await mm.stop()
             mm_task.cancel()
             ws_task.cancel()
-            try:
-                await asyncio.gather(mm_task, ws_task, return_exceptions=True)
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(mm_task, ws_task, return_exceptions=True)
 
     log.info("Shutdown complete")
 
