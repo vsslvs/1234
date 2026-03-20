@@ -43,8 +43,8 @@ import time
 from typing import Dict, Optional, Tuple
 
 from config import Config
-from market_calculator import BtcMarket, MarketCalculator, SIDE_BUY, SIDE_SELL
-from polymarket_client import MakerOrder, PolymarketClient
+from market_calculator import BtcMarket, MarketCalculator
+from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
 from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
@@ -193,7 +193,7 @@ class MarketMaker:
             # Strong UP signal: quote YES at TARGET_PRICE_YES
             target = Config.TARGET_PRICE_YES
             edge = self._calc.edge_bps(fair_yes, target, fair_yes)
-            if edge >= Config.MIN_EDGE_BPS or True:  # always quote in entry window
+            if edge >= Config.MIN_EDGE_BPS:
                 tasks.append(self._refresh_side(state.yes, target))
         else:
             # Signal is not strong enough: cancel any existing YES order

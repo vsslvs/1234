@@ -87,9 +87,9 @@ class OrderBookWS:
         self._reconnect_delay = 1.0  # seconds, doubles on each failure
 
     def _stream_url(self) -> str:
-        symbol = Config.SYMBOL.lower()
+        symbol = Config.BTC_SYMBOL.lower()
         streams = f"{symbol}@depth20@100ms/{symbol}@kline_5m"
-        return f"{Config.WS_BASE}/{streams}"
+        return f"{Config.BINANCE_WS_URL}/{streams}"
 
     async def run(self) -> None:
         """Connect and keep reconnecting on failure."""

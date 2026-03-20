@@ -27,6 +27,7 @@ Key design points:
 """
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -38,7 +39,7 @@ from ws_orderbook import OrderBookWS
 
 
 def _setup_logging() -> None:
-    level = getattr(logging, Config._get("LOG_LEVEL", "INFO"), logging.INFO)
+    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO"), logging.INFO)
     logging.basicConfig(
         level=level,
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s – %(message)s",

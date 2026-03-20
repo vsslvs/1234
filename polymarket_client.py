@@ -19,8 +19,6 @@ endpoint, so we parallelize to minimize wall-clock time.
 Target: < 100 ms total for the gather.
 """
 import asyncio
-import hashlib
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -28,9 +26,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 from eth_account import Account
-from eth_account.messages import encode_defunct
-from eth_account.structured_data.hashing import hash_domain, hash_message
-from web3 import Web3
+from eth_account.messages import encode_typed_data
 
 from config import Config
 
@@ -109,9 +105,7 @@ class PolymarketClient:
         self._fee_cache: Dict[str, FeeRate] = {}
 
     async def __aenter__(self):
-        timeout = aiohttp.ClientTimeout(
-            total=Config.CANCEL_REPLACE_TIMEOUT_MS / 1000
-        )
+        timeout = aiohttp.ClientTimeout(total=5.0)
         connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=30)
         self._session = aiohttp.ClientSession(
             base_url=Config.CLOB_API_URL,
@@ -202,8 +196,8 @@ class PolymarketClient:
             "message":     order,
         }
 
-        encoded = Web3().eth.account._structured_data_encoder(structured_data)
-        sig = self._account.sign_message(encode_defunct(hexstr=encoded.hex()))
+        message = encode_typed_data(full_message=structured_data)
+        sig = self._account.sign_message(message)
 
         return {
             **{k: str(v) for k, v in order.items()},

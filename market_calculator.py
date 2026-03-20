@@ -27,6 +27,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -139,10 +140,12 @@ class MarketCalculator:
             if not yes_token or not no_token:
                 return None
 
-            # Parse window boundaries from market end time
-            end_ts = int(item.get("endDateIso", item.get("end_date_iso", 0)))
-            if end_ts == 0:
+            # Parse window boundaries from market end time (ISO 8601 string)
+            end_str = item.get("endDateIso", item.get("end_date_iso", ""))
+            if not end_str:
                 return None
+            dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            end_ts = int(dt.timestamp())
             start_ts = end_ts - WINDOW_SEC
 
             return BtcMarket(
