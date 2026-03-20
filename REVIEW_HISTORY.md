@@ -71,4 +71,73 @@ market_calculator.py    добавлен: from datetime import datetime
 
 ---
 
+---
+
+## Session 3 — 2026-03-20 — Ревью логики и работоспособности бота
+
+**Описание:** Глубокое ревью алгоритмической логики — не синтаксис, а корректность работы end-to-end.
+**Оценка работоспособности: 25 / 100**
+**Статус:** Ошибки найдены, исправления не применялись (только отчёт).
+
+### Найденные ошибки
+
+| # | Severity | Файл | Строки | Описание |
+|---|---|---|---|---|
+| 1 | CRITICAL | `ws_orderbook.py` | 91–92 | Binance combined streams URL неверный: `/ws/s1/s2` вместо `/stream?streams=s1/s2`. `_handle()` ищет ключ `"stream"` в сообщении — он есть только у combined format. Одиночный `/ws/` поток его не имеет → book никогда не обновляется → `mid_price = None` всегда |
+| 2 | CRITICAL | `market_calculator.py` | 113 | Тег `"btc-5m"` не существует в Gamma API → 0 рынков → `self._markets` пуст → `current_market()` всегда `None` → бот крутит пустой цикл без единого ордера |
+| 3 | CRITICAL | `market_maker.py` | 195–196 | Знак `edge_bps` перепутан для BUY: формула `(quoted − fair) × 10000` даёт +700bps при покупке за 0.92 при fair=0.85, бот трактует это как преимущество. Реально это переплата. Для BUY формула должна быть `(fair − quoted) × 10000` |
+| 4 | HIGH | config.py + market_maker.py | 55 | `P_UP_THRESHOLD = 0.80 < TARGET_PRICE_YES = 0.92` → отрицательный EV: EV = 0.80×$0.08 − 0.20×$0.92 = **−$0.12 за акцию**. Для безубыточности при покупке по 0.92 нужен порог > 0.92 |
+| 5 | HIGH | `polymarket_client.py` | 326–333 | `cancel_replace`: `cancel_ok` не проверяется. Если cancel вернул False и place успешен → два открытых ордера на рынке → двойное заполнение / неконтролируемый риск |
+| 6 | HIGH | Общий поток | — | Нет обработки случая 0 рынков от Gamma API: бот уходит в бесконечный пустой цикл без error-лога и без выхода |
+| 7 | MEDIUM | `market_calculator.py` | 147–149 | `window_start` из Gamma API может не совпасть с `current_window_start()` если `endDateIso` не выровнен по 5-минутной сетке. `current_market()` вернёт None даже при наличии нужного рынка |
+| 8 | MEDIUM | `market_maker.py` | 226 | Только `SIDE_BUY` — односторонние котировки (только биды). Maker-рибейты на Polymarket предполагают двусторонние котировки. Профит от рибейтов под вопросом при one-sided стратегии |
+| 9 | MEDIUM | `market_calculator.py` | 130 | Memory leak: `self._markets` dict никогда не очищается. После 1 дня работы ~288 объектов в памяти, после 7 дней ~2000+, растёт бесконечно |
+| 10 | LOW | `market_maker.py` | 43, 272 | Неиспользуемый импорт `Tuple`; на первой итерации `_market_refresh_loop` сразу вызывает fetch без задержки (дублирует вызов из `run()`) |
+
+### Что работает корректно
+
+| Компонент | Статус |
+|---|---|
+| EIP-712 подпись через `encode_typed_data` | ✓ |
+| `feeRateBps` в подписанном struct | ✓ |
+| `get_fee_rate` с 5с кешем | ✓ |
+| `cancel_replace` через `asyncio.gather` | ✓ (кроме проверки cancel_ok) |
+| Математика BUY: makerAmount=USDC, takerAmount=shares | ✓ |
+| Window timing (`seconds_to_close`, `is_entry_window`) | ✓ |
+| ISO-дата парсинг endDateIso | ✓ |
+| Логистическая функция p_up_signal | ✓ математически |
+| Config loading, reconnect-логика WS | ✓ |
+
+### Коренные причины
+
+- **Binance URL:** Незнание разницы между single-stream endpoint (`/ws/<stream>`) и combined-stream endpoint (`/stream?streams=s1/s2`). Это разные пути, не просто разные параметры.
+- **Gamma API tag:** Несуществующий тег. Правильный поиск по Gamma — через `slug`, `clob_token_ids`, или `condition_id`, не произвольный `tag`.
+- **Edge sign:** Концептуальная ошибка: формула `(quoted − fair)` описывает преимущество продавца (хорошо, что продаёшь выше fair), но для покупателя нужно `(fair − quoted)` (хорошо, что покупаешь ниже fair).
+- **P_UP_THRESHOLD vs TARGET_PRICE:** Не проверена математика EV. Для покупки по цене X с нулевыми комиссиями нужен сигнал > X для положительного EV.
+- **Cancel check:** Асимметричная обработка ошибок в `asyncio.gather` — только вторая задача (place) проверяется на ошибку.
+
+### Необходимые исправления
+
+```
+ws_orderbook.py:92          URL: /ws/{s1}/{s2}
+                              → /stream?streams={s1}/{s2}
+
+market_calculator.py:112-116  params "tag":"btc-5m"
+                              → использовать slug-поиск или clob_token_ids
+
+market_maker.py:195-196     edge = self._calc.edge_bps(fair_yes, target, fair_yes)
+                              → edge = (fair_yes - target) * 10_000
+                            if edge >= Config.MIN_EDGE_BPS
+                              → вместе с поднятием P_UP_THRESHOLD > TARGET_PRICE_YES
+
+config.py:55-56             P_UP_THRESHOLD   = 0.80  → 0.94
+                            P_DOWN_THRESHOLD = 0.20  → 0.06
+
+polymarket_client.py:326-333  добавить проверку cancel_ok + лог
+
+Общий поток               добавить выход/ретраи при 0 рынков от Gamma
+
+market_calculator.py:130  добавить очистку устаревших рынков из self._markets
+```
+
 <!-- Новые сессии ревью добавляются выше этой строки -->
