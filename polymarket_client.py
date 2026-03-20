@@ -329,8 +329,27 @@ class PolymarketClient:
             log.error("cancel_replace place failed: %s", new_order_or_exc)
             return None
 
+        new_order: MakerOrder = new_order_or_exc
+
+        # cancel_ok is bool (from cancel_order) or an Exception.
+        # If the cancel did not succeed, the old order may still be open alongside
+        # the newly placed one. Abort by cancelling the new order immediately to
+        # prevent double exposure. The caller keeps old_order as the active order
+        # and will retry on the next tick.
+        cancel_succeeded = isinstance(cancel_ok, bool) and cancel_ok
+        if not cancel_succeeded:
+            log.warning(
+                "cancel_replace: cancel of %s failed (%s) — aborting new order %s "
+                "to prevent double exposure",
+                old_order.order_id,
+                cancel_ok,
+                new_order.order_id,
+            )
+            await self.cancel_order(new_order.order_id)
+            return None
+
         log.debug("cancel_replace completed in %.1f ms", elapsed_ms)
-        return new_order_or_exc
+        return new_order
 
     # ------------------------------------------------------------------
     # Query open orders

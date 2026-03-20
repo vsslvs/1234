@@ -89,7 +89,11 @@ class OrderBookWS:
     def _stream_url(self) -> str:
         symbol = Config.BTC_SYMBOL.lower()
         streams = f"{symbol}@depth20@100ms/{symbol}@kline_5m"
-        return f"{Config.BINANCE_WS_URL}/{streams}"
+        # Combined streams require /stream?streams= endpoint (not /ws/<path>).
+        # Single-stream /ws/ endpoint does not wrap messages in
+        # {"stream": ..., "data": ...}, so _handle() would never match depth/kline.
+        base = Config.BINANCE_WS_URL.removesuffix("/ws")
+        return f"{base}/stream?streams={streams}"
 
     async def run(self) -> None:
         """Connect and keep reconnecting on failure."""

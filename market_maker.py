@@ -40,20 +40,22 @@ asyncio.gather brings total wall-clock time to max(cancel_rtt, place_rtt).
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from config import Config
 from market_calculator import BtcMarket, MarketCalculator
-from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
+from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
 from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
 
 # Minimum price change to trigger a cancel/replace (avoids churn)
 PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
-# Probability threshold: only quote if signal is this strong
-P_UP_THRESHOLD   = 0.80
-P_DOWN_THRESHOLD = 0.20
+# Probability threshold: only quote if signal is this strong.
+# For positive EV buying YES at TARGET_PRICE_YES=0.92 we need p_up > 0.92.
+# Using 0.94 gives ~200 bps expected edge at entry, providing a safety margin.
+P_UP_THRESHOLD   = 0.94
+P_DOWN_THRESHOLD = 0.06
 
 
 class MarketSide:
@@ -183,28 +185,32 @@ class MarketMaker:
 
     async def _quote_window(self, state: WindowState, market: BtcMarket) -> None:
         """Place or refresh maker orders based on directional signal."""
+        # fair_prices() calls p_up_signal() internally — no duplicate call needed.
+        # fair_prices returns (p_up, 1-p_up), so fair_yes == p_up by definition.
         fair_yes, fair_no = self._calc.fair_prices(market)
-        p_up = self._calc.p_up_signal(market)
+        p_up = fair_yes
 
         tasks = []
 
-        # ----- YES side -----
+        # ----- YES side: buy UP token if strong upside signal -----
         if p_up > P_UP_THRESHOLD:
-            # Strong UP signal: quote YES at TARGET_PRICE_YES
             target = Config.TARGET_PRICE_YES
-            edge = self._calc.edge_bps(fair_yes, target, fair_yes)
+            # BUY edge = (fair - target) × 10000.
+            # Positive means we are buying BELOW our estimated fair value.
+            edge = (fair_yes - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
                 tasks.append(self._refresh_side(state.yes, target))
         else:
-            # Signal is not strong enough: cancel any existing YES order
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
 
-        # ----- NO side -----
+        # ----- NO side: buy DOWN token if strong downside signal -----
         if p_up < P_DOWN_THRESHOLD:
-            # Strong DOWN signal: quote NO at TARGET_PRICE_NO
             target = Config.TARGET_PRICE_NO
-            tasks.append(self._refresh_side(state.no, target))
+            # BUY edge for NO: (fair_no - target) × 10000
+            edge = (fair_no - target) * 10_000
+            if edge >= Config.MIN_EDGE_BPS:
+                tasks.append(self._refresh_side(state.no, target))
         else:
             if state.no.has_order:
                 tasks.append(self._cancel_side(state.no))
@@ -269,10 +275,15 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self) -> None:
+        # Sleep FIRST so the initial fetch in run() is not immediately duplicated.
         while self._running:
-            await self._refresh_market_list()
             await asyncio.sleep(600)
+            if self._running:
+                await self._refresh_market_list()
 
     async def _refresh_market_list(self) -> None:
         markets = await self._calc.fetch_upcoming_markets()
-        log.debug("Market list refreshed: %d markets", len(markets))
+        if not markets:
+            log.warning("No BTC 5m markets found — will retry on next refresh cycle")
+        else:
+            log.debug("Market list refreshed: %d markets", len(markets))

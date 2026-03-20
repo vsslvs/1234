@@ -23,6 +23,7 @@ Usage:
     p_up = calc.p_up_signal()
 """
 import asyncio
+import json as _json
 import logging
 import math
 import time
@@ -106,53 +107,124 @@ class MarketCalculator:
 
     async def fetch_upcoming_markets(self) -> List[BtcMarket]:
         """
-        Query Gamma for active BTC 5-minute up/down markets.
-        Returns markets sorted by window_start ascending.
+        Fetch BTC 5-minute up/down markets from Gamma API.
+
+        Market slugs follow a deterministic pattern based on window start time:
+            btc-updown-5m-{window_start_unix_ts}
+
+        We calculate slugs directly from the current time — no tag/keyword
+        search required. Fetch the current window + 5 future windows as a
+        lookahead buffer so the bot is never caught without a known market.
+        All 6 requests fire concurrently via asyncio.gather.
         """
-        params = {
-            "tag":    "btc-5m",
-            "active": "true",
-            "limit":  "50",
-        }
-        try:
-            async with self._session.get(f"{GAMMA_API}/markets", params=params) as r:
-                r.raise_for_status()
-                items = await r.json()
-        except Exception as exc:
-            log.error("Failed to fetch markets from Gamma: %s", exc)
-            return []
+        now_ts = int(time.time())
+        current_ws = (now_ts // WINDOW_SEC) * WINDOW_SEC
+        slugs = [
+            f"btc-updown-5m-{current_ws + i * WINDOW_SEC}"
+            for i in range(6)
+        ]
+
+        results = await asyncio.gather(
+            *[self._fetch_market_by_slug(s) for s in slugs],
+            return_exceptions=True,
+        )
 
         markets = []
-        for item in items:
-            market = self._parse_market(item)
-            if market:
-                markets.append(market)
-                self._markets[market.window_start] = market
+        for result in results:
+            if isinstance(result, BtcMarket):
+                markets.append(result)
+                self._markets[result.window_start] = result
+
+        # Memory management: purge market objects older than one window
+        cutoff = current_ws - WINDOW_SEC
+        for k in [k for k in self._markets if k < cutoff]:
+            del self._markets[k]
 
         log.info("Fetched %d BTC 5m markets from Gamma", len(markets))
         return sorted(markets, key=lambda m: m.window_start)
 
-    def _parse_market(self, item: dict) -> Optional[BtcMarket]:
+    async def _fetch_market_by_slug(self, slug: str) -> Optional[BtcMarket]:
+        """Fetch a single market by exact slug from Gamma API."""
         try:
-            tokens = item.get("tokens", [])
-            yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), None)
-            no_token  = next((t for t in tokens if t.get("outcome") == "No"),  None)
-            if not yes_token or not no_token:
+            async with self._session.get(
+                f"{GAMMA_API}/markets", params={"slug": slug}
+            ) as r:
+                r.raise_for_status()
+                items = await r.json()
+        except Exception as exc:
+            log.debug("Failed to fetch slug=%s: %s", slug, exc)
+            return None
+        if not items:
+            return None
+        item = items[0] if isinstance(items, list) else items
+        return self._parse_market(item)
+
+    def _parse_market(self, item: dict) -> Optional[BtcMarket]:
+        """
+        Parse a Gamma API market dict into a BtcMarket.
+
+        Real Gamma API structure (verified against live market data):
+          - item["outcomes"]    = JSON-encoded string: "[\"Up\", \"Down\"]"
+          - item["clobTokenIds"] = JSON-encoded string: "[\"id1\", \"id2\"]"
+          - outcomes[i] maps to clobTokenIds[i] (parallel arrays)
+          - item["slug"]         = "btc-updown-5m-{window_start_ts}"
+          - item["endDateIso"]   = date-only string ("2026-03-20") — NOT used
+
+        Window boundaries are extracted from the slug (most reliable source).
+        """
+        try:
+            # Decode parallel JSON-encoded string arrays
+            outcomes_raw = item.get("outcomes", "[]")
+            clob_ids_raw = item.get("clobTokenIds", "[]")
+            outcomes = (
+                _json.loads(outcomes_raw)
+                if isinstance(outcomes_raw, str)
+                else outcomes_raw
+            )
+            clob_ids = (
+                _json.loads(clob_ids_raw)
+                if isinstance(clob_ids_raw, str)
+                else clob_ids_raw
+            )
+
+            if len(outcomes) != 2 or len(clob_ids) != 2:
                 return None
 
-            # Parse window boundaries from market end time (ISO 8601 string)
-            end_str = item.get("endDateIso", item.get("end_date_iso", ""))
-            if not end_str:
+            # Map "Up"/"Yes" → yes_token_id,  "Down"/"No" → no_token_id
+            yes_token_id: Optional[str] = None
+            no_token_id:  Optional[str] = None
+            for outcome, token_id in zip(outcomes, clob_ids):
+                ol = outcome.lower()
+                if ol in ("up", "yes"):
+                    yes_token_id = str(token_id)
+                elif ol in ("down", "no"):
+                    no_token_id = str(token_id)
+
+            if not yes_token_id or not no_token_id:
                 return None
-            dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-            end_ts = int(dt.timestamp())
-            start_ts = end_ts - WINDOW_SEC
+
+            # Derive window boundaries from the deterministic slug
+            slug = item.get("slug", "")
+            if slug.startswith("btc-updown-5m-"):
+                start_ts = int(slug.split("-")[-1])
+                end_ts   = start_ts + WINDOW_SEC
+            else:
+                # Fallback: parse endDateIso and round to 5-minute grid
+                end_str = item.get("endDateIso", item.get("end_date_iso", ""))
+                if not end_str:
+                    return None
+                dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                # Round to nearest 5-minute boundary to absorb small timing offsets
+                end_ts   = round(int(dt.timestamp()) / WINDOW_SEC) * WINDOW_SEC
+                start_ts = end_ts - WINDOW_SEC
 
             return BtcMarket(
                 question_id=str(item.get("id", "")),
-                condition_id=str(item.get("conditionId", item.get("condition_id", ""))),
-                yes_token_id=str(yes_token["tokenId"]),
-                no_token_id=str(no_token["tokenId"]),
+                condition_id=str(
+                    item.get("conditionId", item.get("condition_id", ""))
+                ),
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
                 window_start=start_ts,
                 window_end=end_ts,
             )

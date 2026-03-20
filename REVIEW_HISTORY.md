@@ -5,6 +5,35 @@
 
 ---
 
+## Session 4 — 2026-03-20 — Применение исправлений (все критические баги устранены)
+
+**Статус:** Все исправления применены и запушены. Оценка работоспособности: **~80 / 100**.
+
+### Что было исправлено
+
+| # | Файл | Строки | Баг | Исправление |
+|---|---|---|---|---|
+| 1 | `ws_orderbook.py` | 89–92 | Binance URL: `/ws/s1/s2` (single-stream) вместо `/stream?streams=s1/s2` (combined) → `book` никогда не обновлялся | `base.removesuffix("/ws")` + `f"{base}/stream?streams={streams}"` |
+| 2 | `market_calculator.py` | 107–133 | Тег `"btc-5m"` не существует → 0 рынков, бот крутит пустой цикл | Slug-based fetch: `btc-updown-5m-{window_start_ts}`. Детерминированное вычисление из времени, 6 параллельных запросов |
+| 3 | `market_calculator.py` | 135–161 | Поле `tokens[]` с `{outcome, tokenId}` не существует в реальном Gamma API. Реально: `outcomes` + `clobTokenIds` (оба JSON-encoded строки). Исходы "Up"/"Down", а не "Yes"/"No". `endDateIso` = только дата без времени | Полностью переписан `_parse_market()`: `_json.loads()`, zip параллельных массивов, window boundaries из slug |
+| 4 | `market_calculator.py` | 107–133 | Memory leak: `self._markets` никогда не очищался | Purge stale keys: `cutoff = current_ws - WINDOW_SEC` |
+| 5 | `market_maker.py` | 184–213 | `edge_bps` знак перепутан для BUY: `(quoted−fair)` вместо `(fair−quoted)` → бот думал, что покупает с преимуществом, реально переплачивал | Инлайн: `edge = (fair_yes - target) * 10_000` |
+| 6 | `market_maker.py` | 203–207 | Нет edge-проверки для NO стороны | Добавлен: `edge = (fair_no - target) * 10_000; if edge >= MIN_EDGE_BPS` |
+| 7 | `market_maker.py` | 55–56 | P_UP_THRESHOLD=0.80 < TARGET_PRICE_YES=0.92 → отрицательный EV: 0.80×$0.08 − 0.20×$0.92 = −$0.12/share | P_UP_THRESHOLD=0.94, P_DOWN_THRESHOLD=0.06. EV@0.94: +$0.02/share |
+| 8 | `market_maker.py` | 186–187 | `p_up_signal()` вызывался дважды за тик (внутри `fair_prices()` и явно) | Удалён дублирующий вызов: `p_up = fair_yes` |
+| 9 | `market_maker.py` | 271–274 | `_market_refresh_loop` делал fetch сразу при старте, дублируя init-fetch | Sleep перемещён перед fetch в loop |
+| 10 | `market_maker.py` | 276–278 | Нет предупреждения при 0 рынках | `log.warning("No BTC 5m markets found ...")` |
+| 11 | `market_maker.py` | 43, 47 | Неиспользуемые импорты `Tuple`, `SIDE_SELL` | Удалены |
+| 12 | `polymarket_client.py` | 320–333 | `cancel_replace`: cancel_ok не проверялся → при провале cancel + успехе place одновременно два открытых ордера | Проверка `cancel_succeeded`; при провале cancel — отменяется новый ордер |
+
+### Открытые вопросы (не фатальные для запуска)
+
+- `check_approvals()` использует `/auth/approvals` — при 404 бот продолжит со WARNING
+- Стратегия односторонняя (только BUY) — maker rebates могут быть меньше
+- Logistic k=1500: порог 94% достигается при ret ≈ 0.20% — нужна калибровка на реальных данных
+
+---
+
 ## Session 1 — 2026-03-20 — Первоначальное написание бота (Binance)
 
 **Описание:** Первая версия бота — тейкерская стратегия арбитража между Binance и Polymarket.
