@@ -282,8 +282,13 @@ class MarketCalculator:
             return 0.5
 
         if market.open_price is None:
-            market.open_price = mid
-            return 0.5
+            # Use the Binance 5-minute candle open as the window reference price.
+            # Binance 5m candles share the same UTC-based grid as Polymarket 5m windows
+            # (both align to multiples of 300 seconds), so candle.open is the BTC price
+            # at window_start — exactly what the signal needs.
+            # Fallback to mid only if kline data is unavailable (e.g. at startup).
+            candle_open = self._ob_ws.candle.open
+            market.open_price = candle_open if candle_open > 0 else mid
 
         ret = (mid - market.open_price) / market.open_price
         p_up = 1.0 / (1.0 + math.exp(-K_SIGNAL * ret))
