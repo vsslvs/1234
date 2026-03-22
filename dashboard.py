@@ -91,7 +91,20 @@ HTML_PAGE = """\
 
 <h1>Polymarket BTC 5m Market Maker</h1>
 
-<div id="paper-banner" class="paper-banner" style="display:none;">PAPER TRADING — виртуальный баланс: <span id="paper-bal">--</span> USDC</div>
+<div id="paper-banner" class="paper-banner" style="display:none;">
+  <span id="mode-label">PAPER TRADING</span> — виртуальный баланс: <span id="paper-bal">--</span> USDC
+  <button id="toggle-btn" onclick="toggleMode()" style="
+    margin-left:16px; padding:4px 14px; border-radius:6px; border:1px solid #ffc107;
+    background:#0d1117; color:#ffc107; font-weight:600; cursor:pointer; font-size:0.85em;
+  ">Switch to LIVE</button>
+</div>
+<div id="live-banner" class="paper-banner" style="display:none; background:#1b4332; border-color:#40c057; color:#40c057;">
+  LIVE TRADING
+  <button id="toggle-btn-live" onclick="toggleMode()" style="
+    margin-left:16px; padding:4px 14px; border-radius:6px; border:1px solid #40c057;
+    background:#0d1117; color:#40c057; font-weight:600; cursor:pointer; font-size:0.85em;
+  ">Switch to PAPER</button>
+</div>
 
 <div class="status-bar">
   <span id="conn-dot" class="dot-ok"></span>
@@ -184,12 +197,14 @@ async function refresh() {
 
     $('conn-dot').className = 'dot-ok';
 
-    // Paper trading banner
+    // Mode banners
     if (d.paper_trading) {
       $('paper-banner').style.display = 'block';
+      $('live-banner').style.display = 'none';
       $('paper-bal').textContent = fmt(d.paper_balance, 2);
     } else {
       $('paper-banner').style.display = 'none';
+      $('live-banner').style.display = 'block';
     }
 
     // Uptime
@@ -262,12 +277,35 @@ async function refresh() {
   }
 }
 
+async function toggleMode() {
+  if (!confirm('Переключить режим торговли?')) return;
+  try {
+    const r = await fetch('/api/toggle-mode', {method: 'POST'});
+    const d = await r.json();
+    if (d.error) { alert('Ошибка: ' + d.error); }
+  } catch(e) { alert('Ошибка подключения'); }
+}
+
 setInterval(refresh, 1000);
 refresh();
 </script>
 </body>
 </html>
 """
+
+
+# ── Shared references (set by main.py after creating MarketMaker) ────────
+_market_maker = None
+_live_client = None
+_paper_client = None
+
+
+def set_market_maker(mm, live_client, paper_client):
+    """Called from main.py to give the dashboard access to the MarketMaker."""
+    global _market_maker, _live_client, _paper_client
+    _market_maker = mm
+    _live_client = live_client
+    _paper_client = paper_client
 
 
 # ── API handlers ─────────────────────────────────────────────────────────
@@ -280,6 +318,27 @@ async def handle_api_state(request):
     return web.json_response(state.to_dict())
 
 
+async def handle_toggle_mode(request):
+    """Toggle between paper and live trading mode."""
+    if _market_maker is None:
+        return web.json_response({"error": "Bot not ready"}, status=503)
+
+    if state.paper_trading:
+        # Switch to LIVE
+        if _live_client is None:
+            return web.json_response({"error": "Live client not available"}, status=400)
+        await _market_maker.swap_client(_live_client)
+        log.info("Switched to LIVE mode via dashboard")
+        return web.json_response({"mode": "live"})
+    else:
+        # Switch to PAPER
+        if _paper_client is None:
+            return web.json_response({"error": "Paper client not available"}, status=400)
+        await _market_maker.swap_client(_paper_client)
+        log.info("Switched to PAPER mode via dashboard")
+        return web.json_response({"mode": "paper"})
+
+
 # ── Start / stop ─────────────────────────────────────────────────────────
 
 async def start_dashboard(port: int = DASHBOARD_PORT) -> web.AppRunner:
@@ -287,6 +346,7 @@ async def start_dashboard(port: int = DASHBOARD_PORT) -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/state", handle_api_state)
+    app.router.add_post("/api/toggle-mode", handle_toggle_mode)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

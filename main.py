@@ -33,7 +33,7 @@ import sys
 
 from bot_state import state as dashboard_state
 from config import Config
-from dashboard import start_dashboard
+from dashboard import start_dashboard, set_market_maker
 from market_calculator import MarketCalculator
 from market_maker import MarketMaker
 from paper_client import PaperClient
@@ -76,36 +76,43 @@ async def _main() -> None:
 
     log.info("BTC mid-price: %.2f", ob_ws.book.mid_price or 0)
 
-    client_cm = PaperClient() if Config.PAPER_TRADING else PolymarketClient()
-    async with client_cm as client:
-        async with MarketCalculator(ob_ws) as calc:
-            mm = MarketMaker(client, calc, ob_ws)
+    paper_client = PaperClient()
+    live_client = PolymarketClient()
 
-            loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
+    # Start with the configured mode
+    start_client = paper_client if Config.PAPER_TRADING else live_client
 
-            def _handle_signal(sig):
-                log.info("Signal %s received — stopping", sig.name)
-                stop_event.set()
+    async with paper_client:
+        async with live_client:
+            async with MarketCalculator(ob_ws) as calc:
+                mm = MarketMaker(start_client, calc, ob_ws)
+                set_market_maker(mm, live_client, paper_client)
 
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, _handle_signal, sig)
+                loop = asyncio.get_running_loop()
+                stop_event = asyncio.Event()
 
-            mm_task = asyncio.create_task(mm.run(), name="market-maker")
+                def _handle_signal(sig):
+                    log.info("Signal %s received — stopping", sig.name)
+                    stop_event.set()
 
-            await asyncio.wait(
-                [mm_task, asyncio.create_task(stop_event.wait())],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, _handle_signal, sig)
 
-            log.info("Stopping — cancelling all open orders")
-            await mm.stop()
-            mm_task.cancel()
-            ws_task.cancel()
-            try:
-                await asyncio.gather(mm_task, ws_task, return_exceptions=True)
-            except asyncio.CancelledError:
-                pass
+                mm_task = asyncio.create_task(mm.run(), name="market-maker")
+
+                await asyncio.wait(
+                    [mm_task, asyncio.create_task(stop_event.wait())],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                log.info("Stopping — cancelling all open orders")
+                await mm.stop()
+                mm_task.cancel()
+                ws_task.cancel()
+                try:
+                    await asyncio.gather(mm_task, ws_task, return_exceptions=True)
+                except asyncio.CancelledError:
+                    pass
 
     await dash_runner.cleanup()
     log.info("Shutdown complete")

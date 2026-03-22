@@ -150,6 +150,20 @@ class MarketMaker:
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, interval - elapsed))
 
+    async def swap_client(self, new_client) -> None:
+        """Hot-swap the trading client (paper ↔ live) without stopping the bot."""
+        log.info("Swapping client → %s", type(new_client).__name__)
+        # Cancel all orders on the old client
+        if self._state:
+            await self._cancel_window(self._state)
+            self._state = None
+        await self._client.cancel_all_orders()
+        self._client = new_client
+        await self._client.check_approvals()
+        is_paper = hasattr(new_client, 'resolve_trade')
+        dashboard_state.paper_trading = is_paper
+        log.info("Client swapped to %s mode", "PAPER" if is_paper else "LIVE")
+
     async def stop(self) -> None:
         self._running = False
         self._stats.log_summary(
