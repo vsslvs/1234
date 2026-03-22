@@ -25,11 +25,14 @@ Key design points:
   - Taker fee at p=50% is ~1.56% — we only quote when P(up) > 80%
     or P(down) > 80% to avoid quoting into adverse selection
 """
+import argparse
 import asyncio
 import logging
 import os
 import signal
 import sys
+import termios
+import tty
 
 from bot_state import state as dashboard_state
 from config import Config
@@ -50,14 +53,58 @@ def _setup_logging() -> None:
     )
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Polymarket BTC 5m market maker")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--paper", action="store_true", help="Start in paper trading mode")
+    group.add_argument("--live", action="store_true", help="Start in live trading mode")
+    return parser.parse_args()
+
+
+async def _stdin_listener(mm, live_client, paper_client, log):
+    """Listen for keyboard commands in the terminal."""
+    loop = asyncio.get_running_loop()
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        log.info("Keyboard shortcuts: [p] toggle paper/live  [q] quit")
+        while True:
+            char = await loop.run_in_executor(None, sys.stdin.read, 1)
+            if char == 'p':
+                if dashboard_state.paper_trading:
+                    await mm.swap_client(live_client)
+                    log.info("Switched to LIVE mode (keyboard)")
+                else:
+                    await mm.swap_client(paper_client)
+                    log.info("Switched to PAPER mode (keyboard)")
+            elif char == 'q':
+                log.info("Quit requested (keyboard)")
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 async def _main() -> None:
+    args = _parse_args()
     _setup_logging()
     log = logging.getLogger("main")
     wallet_short = Config.PRIVATE_KEY[:6] + "..." + Config.PRIVATE_KEY[-4:]
-    mode = "PAPER" if Config.PAPER_TRADING else "LIVE"
+
+    # Determine starting mode: CLI flag > .env setting
+    if args.live:
+        start_paper = False
+    elif args.paper:
+        start_paper = True
+    else:
+        start_paper = Config.PAPER_TRADING
+
+    mode = "PAPER" if start_paper else "LIVE"
     log.info("BTC 5m market maker starting | %s mode | wallet=%s", mode, wallet_short)
     dashboard_state.wallet = wallet_short
-    dashboard_state.paper_trading = Config.PAPER_TRADING
+    dashboard_state.paper_trading = start_paper
 
     # Web dashboard
     dash_runner = await start_dashboard()
@@ -79,8 +126,8 @@ async def _main() -> None:
     paper_client = PaperClient()
     live_client = PolymarketClient()
 
-    # Start with the configured mode
-    start_client = paper_client if Config.PAPER_TRADING else live_client
+    # Start with the determined mode
+    start_client = paper_client if start_paper else live_client
 
     async with paper_client:
         async with live_client:
@@ -99,9 +146,13 @@ async def _main() -> None:
                     loop.add_signal_handler(sig, _handle_signal, sig)
 
                 mm_task = asyncio.create_task(mm.run(), name="market-maker")
+                stdin_task = asyncio.create_task(
+                    _stdin_listener(mm, live_client, paper_client, log),
+                    name="stdin-listener",
+                )
 
                 await asyncio.wait(
-                    [mm_task, asyncio.create_task(stop_event.wait())],
+                    [mm_task, asyncio.create_task(stop_event.wait()), stdin_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
@@ -109,8 +160,9 @@ async def _main() -> None:
                 await mm.stop()
                 mm_task.cancel()
                 ws_task.cancel()
+                stdin_task.cancel()
                 try:
-                    await asyncio.gather(mm_task, ws_task, return_exceptions=True)
+                    await asyncio.gather(mm_task, ws_task, stdin_task, return_exceptions=True)
                 except asyncio.CancelledError:
                     pass
 
