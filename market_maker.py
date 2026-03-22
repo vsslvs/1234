@@ -43,6 +43,7 @@ import time
 from typing import Dict, Optional
 
 from config import Config
+from dashboard import EventBus
 from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
 from stats import BotStats
@@ -114,14 +115,17 @@ class MarketMaker:
         client: PolymarketClient,
         calc: MarketCalculator,
         ob_ws: OrderBookWS,
+        event_bus: Optional["EventBus"] = None,
     ):
         self._client  = client
         self._calc    = calc
         self._ob_ws   = ob_ws
+        self._bus     = event_bus
         self._state:  Optional[WindowState] = None
         self._running = False
         self._stats   = BotStats()
         self._windows_since_stats_log = 0
+        self._last_state_push: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -175,6 +179,9 @@ class MarketMaker:
         state = self._state
         if state is None:
             return
+
+        # Push state snapshot to dashboard (throttled to ~1/sec)
+        self._push_dashboard_state(market)
 
         # Exit window: cancel everything and wait for resolution
         if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
@@ -306,6 +313,42 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
+            # Emit trade event to dashboard
+            if self._bus:
+                shares = Config.ORDER_SIZE_USDC / side.last_entry_price
+                pnl = shares * (1.0 - side.last_entry_price) if won else -Config.ORDER_SIZE_USDC
+                self._bus.push_trade({
+                    "window_start": market.window_start,
+                    "side": side.side_label,
+                    "entry_price": side.last_entry_price,
+                    "p_signal": side.p_signal_at_entry,
+                    "won": won,
+                    "pnl": round(pnl, 2),
+                })
+
+    # ------------------------------------------------------------------
+    # Dashboard state push
+    # ------------------------------------------------------------------
+
+    def _push_dashboard_state(self, market: BtcMarket) -> None:
+        if not self._bus:
+            return
+        now = time.monotonic()
+        if now - self._last_state_push < 1.0:
+            return
+        self._last_state_push = now
+
+        self._bus.push_state({
+            "status": "running" if self._running else "stopped",
+            "btc_price": self._ob_ws.book.mid_price,
+            "uptime_sec": round(time.time() - self._stats._session_start, 0),
+            "wallet": Config.PRIVATE_KEY[:6] + "..." + Config.PRIVATE_KEY[-4:],
+            "current_window": market.window_start,
+            "seconds_to_close": round(market.seconds_to_close, 0),
+            "is_entry_window": market.is_entry_window,
+            "stats": self._stats.to_dict(),
+            "markets": self._calc.get_markets_snapshot(),
+        })
 
     # ------------------------------------------------------------------
     # Order helpers

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC Market Maker Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Header */
+  .header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  .header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  .status-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .status-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.off { background: var(--red); }
+  .header-info { display: flex; gap: 16px; flex-wrap: wrap; }
+  .header-info span { font-size: 13px; color: var(--text2); }
+  .header-info .val { color: var(--text); font-weight: 500; font-family: 'SF Mono', Consolas, monospace; }
+
+  /* Grid */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 16px 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+
+  /* Cards */
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .card-header {
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .card-body { padding: 14px; }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 12px;
+  }
+  .stat-item { text-align: center; }
+  .stat-value {
+    font-size: 22px;
+    font-weight: 700;
+    font-family: 'SF Mono', Consolas, monospace;
+  }
+  .stat-label { font-size: 11px; color: var(--text2); text-transform: uppercase; }
+  .stat-value.positive { color: var(--green); }
+  .stat-value.negative { color: var(--red); }
+
+  /* Markets table */
+  .markets-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .markets-table th {
+    text-align: left;
+    padding: 6px 10px;
+    color: var(--text2);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+  }
+  .markets-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: 'SF Mono', Consolas, monospace; }
+  .markets-table tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge.active { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.entry { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge.upcoming { background: rgba(139,148,158,0.15); color: var(--text2); }
+  .badge.expired { background: rgba(139,148,158,0.1); color: #484f58; }
+
+  /* Errors panel */
+  .card.errors { grid-column: 1 / -1; }
+  .card.errors .card-header { background: rgba(248,81,73,0.1); color: var(--red); }
+  .error-list { max-height: 200px; overflow-y: auto; }
+  .error-item {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    font-family: 'SF Mono', Consolas, monospace;
+  }
+  .error-item:last-child { border-bottom: none; }
+  .error-item .ts { color: var(--text2); margin-right: 8px; }
+  .error-item .module { color: var(--purple); margin-right: 8px; }
+  .error-item.WARNING .msg { color: var(--yellow); }
+  .error-item.ERROR .msg { color: var(--red); }
+  .empty-msg { color: var(--text2); font-size: 13px; padding: 20px; text-align: center; }
+
+  /* Activity log */
+  .card.log-card { grid-column: 1 / -1; }
+  .log-container { max-height: 400px; overflow-y: auto; }
+  .log-line {
+    padding: 3px 10px;
+    font-size: 12px;
+    font-family: 'SF Mono', Consolas, monospace;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-line:last-child { border-bottom: none; }
+  .log-line .ts { color: var(--text2); }
+  .log-line .level { font-weight: 600; margin: 0 4px; }
+  .log-line .level.INFO { color: var(--green); }
+  .log-line .level.DEBUG { color: var(--text2); }
+  .log-line .level.WARNING { color: var(--yellow); }
+  .log-line .level.ERROR { color: var(--red); }
+  .log-line .module { color: var(--purple); }
+
+  /* Connection banner */
+  .conn-banner {
+    display: none;
+    background: rgba(248,81,73,0.15);
+    color: var(--red);
+    text-align: center;
+    padding: 6px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .conn-banner.show { display: block; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="conn-banner" id="connBanner">Disconnected from bot — reconnecting...</div>
+
+<div class="header">
+  <h1><span class="status-dot off" id="statusDot"></span> BTC 5m Market Maker</h1>
+  <div class="header-info">
+    <span>BTC: <span class="val" id="btcPrice">—</span></span>
+    <span>Uptime: <span class="val" id="uptime">—</span></span>
+    <span>Wallet: <span class="val" id="wallet">—</span></span>
+    <span>Window: <span class="val" id="windowTimer">—</span></span>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Statistics -->
+  <div class="card">
+    <div class="card-header">Statistics</div>
+    <div class="card-body">
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="stat-value" id="statTrades">0</div>
+          <div class="stat-label">Trades</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statWinRate">—</div>
+          <div class="stat-label">Win Rate</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statRollingWR">—</div>
+          <div class="stat-label">Rolling WR (50)</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statPnL">$0.00</div>
+          <div class="stat-label">Total P&L</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statAvgPnL">—</div>
+          <div class="stat-label">Avg P&L/Trade</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statWL">0 / 0</div>
+          <div class="stat-label">W / L</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active Markets -->
+  <div class="card">
+    <div class="card-header">Active Markets</div>
+    <div class="card-body" style="padding:0;">
+      <table class="markets-table">
+        <thead>
+          <tr><th>Window</th><th>Status</th><th>Closes in</th><th>Link</th></tr>
+        </thead>
+        <tbody id="marketsBody">
+          <tr><td colspan="4" class="empty-msg">Waiting for market data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Errors -->
+  <div class="card errors" id="errorsCard">
+    <div class="card-header">Errors & Warnings</div>
+    <div class="card-body" style="padding:0;">
+      <div class="error-list" id="errorList">
+        <div class="empty-msg">No errors</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Activity Log -->
+  <div class="card log-card">
+    <div class="card-header">Activity Log</div>
+    <div class="card-body" style="padding:0;">
+      <div class="log-container" id="logContainer">
+        <div class="empty-msg">Connecting to bot...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  /*__WS_TOKEN_PLACEHOLDER__*/
+(function() {
+  const MAX_LOG_LINES = 500;
+  const MAX_ERRORS = 50;
+
+  const $ = id => document.getElementById(id);
+
+  // Elements
+  const connBanner = $('connBanner');
+  const statusDot = $('statusDot');
+  const btcPrice = $('btcPrice');
+  const uptimeEl = $('uptime');
+  const walletEl = $('wallet');
+  const windowTimer = $('windowTimer');
+  const statTrades = $('statTrades');
+  const statWinRate = $('statWinRate');
+  const statRollingWR = $('statRollingWR');
+  const statPnL = $('statPnL');
+  const statAvgPnL = $('statAvgPnL');
+  const statWL = $('statWL');
+  const marketsBody = $('marketsBody');
+  const errorList = $('errorList');
+  const logContainer = $('logContainer');
+
+  let ws = null;
+  let reconnectDelay = 1000;
+  let logLines = 0;
+  let errorCount = 0;
+  let firstLog = true;
+  let firstError = true;
+  let lastState = null;
+
+  function formatTime(isoOrTs) {
+    try {
+      const d = new Date(isoOrTs);
+      return d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    } catch { return ''; }
+  }
+
+  function formatUptime(sec) {
+    if (!sec || sec < 0) return '—';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm ' + s + 's';
+    return s + 's';
+  }
+
+  function formatPnL(val) {
+    if (val == null) return '—';
+    const s = val >= 0 ? '+' : '';
+    return s + '$' + val.toFixed(2);
+  }
+
+  function pnlClass(val) {
+    if (val == null) return '';
+    return val >= 0 ? 'positive' : 'negative';
+  }
+
+  function formatWindowTime(ts) {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
+  }
+
+  // --- State update ---
+  function updateState(data) {
+    lastState = data;
+    statusDot.className = 'status-dot ' + (data.status === 'running' ? 'on' : 'off');
+    btcPrice.textContent = data.btc_price ? '$' + Number(data.btc_price).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—';
+    uptimeEl.textContent = formatUptime(data.uptime_sec);
+    walletEl.textContent = data.wallet || '—';
+    windowTimer.textContent = data.seconds_to_close != null ? Math.round(data.seconds_to_close) + 's' : '—';
+
+    // Stats
+    const s = data.stats || {};
+    statTrades.textContent = s.total_trades || 0;
+    statWinRate.textContent = s.win_rate != null ? (s.win_rate * 100).toFixed(1) + '%' : '—';
+    statRollingWR.textContent = s.rolling_win_rate != null ? (s.rolling_win_rate * 100).toFixed(1) + '%' : '—';
+
+    statPnL.textContent = formatPnL(s.total_pnl);
+    statPnL.className = 'stat-value ' + pnlClass(s.total_pnl);
+
+    statAvgPnL.textContent = formatPnL(s.avg_pnl);
+    statAvgPnL.className = 'stat-value ' + pnlClass(s.avg_pnl);
+
+    statWL.textContent = (s.wins || 0) + ' / ' + (s.losses || 0);
+
+    // Markets
+    const markets = data.markets || [];
+    if (markets.length === 0) {
+      marketsBody.innerHTML = '<tr><td colspan="4" class="empty-msg">No markets loaded</td></tr>';
+    } else {
+      marketsBody.innerHTML = markets.map(m => {
+        const badgeClass = m.status === 'entry' ? 'entry' : m.status === 'active' ? 'active' : m.status === 'upcoming' ? 'upcoming' : 'expired';
+        const closes = m.seconds_to_close > 0 ? Math.round(m.seconds_to_close) + 's' : '—';
+        return '<tr>' +
+          '<td>' + formatWindowTime(m.window_start) + ' – ' + formatWindowTime(m.window_end) + '</td>' +
+          '<td><span class="badge ' + badgeClass + '">' + m.status + '</span></td>' +
+          '<td>' + closes + '</td>' +
+          '<td><a href="' + m.url + '" target="_blank" rel="noopener">Polymarket</a></td>' +
+          '</tr>';
+      }).join('');
+    }
+  }
+
+  // --- Log entry ---
+  function addLogLine(event) {
+    if (firstLog) {
+      logContainer.innerHTML = '';
+      firstLog = false;
+    }
+
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    const ts = '<span class="ts">' + formatTime(event.ts) + '</span>';
+    const level = '<span class="level ' + event.level + '">' + event.level + '</span>';
+    const mod = '<span class="module">' + (event.module || '') + '</span>';
+    div.innerHTML = ts + ' ' + level + ' ' + mod + ' ' + escapeHtml(event.message || '');
+    logContainer.appendChild(div);
+
+    logLines++;
+    while (logLines > MAX_LOG_LINES) {
+      logContainer.removeChild(logContainer.firstChild);
+      logLines--;
+    }
+    logContainer.scrollTop = logContainer.scrollHeight;
+  }
+
+  // --- Error entry ---
+  function addError(event) {
+    if (firstError) {
+      errorList.innerHTML = '';
+      firstError = false;
+    }
+
+    const div = document.createElement('div');
+    div.className = 'error-item ' + event.level;
+    div.innerHTML =
+      '<span class="ts">' + formatTime(event.ts) + '</span>' +
+      '<span class="module">' + (event.module || '') + '</span>' +
+      '<span class="msg">' + escapeHtml(event.message || '') + '</span>';
+    errorList.insertBefore(div, errorList.firstChild);
+
+    errorCount++;
+    while (errorCount > MAX_ERRORS) {
+      errorList.removeChild(errorList.lastChild);
+      errorCount--;
+    }
+  }
+
+  function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // --- WebSocket ---
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let wsUrl = proto + '//' + location.host + '/ws';
+    if (window.__WS_TOKEN) wsUrl += '?token=' + encodeURIComponent(window.__WS_TOKEN);
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = function() {
+      connBanner.classList.remove('show');
+      reconnectDelay = 1000;
+    };
+
+    ws.onclose = function() {
+      connBanner.classList.add('show');
+      statusDot.className = 'status-dot off';
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 16000);
+    };
+
+    ws.onerror = function() {
+      ws.close();
+    };
+
+    ws.onmessage = function(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+
+      switch (msg.type) {
+        case 'state':
+          updateState(msg.data);
+          break;
+        case 'trade':
+          addLogLine({
+            ts: msg.data.ts || new Date().toISOString(),
+            level: msg.data.won ? 'INFO' : 'ERROR',
+            module: 'trade',
+            message: (msg.data.won ? 'WIN' : 'LOSS') +
+              '  side=' + msg.data.side +
+              '  @' + (msg.data.entry_price || 0).toFixed(4) +
+              '  signal=' + ((msg.data.p_signal || 0) * 100).toFixed(1) + '%' +
+              '  P&L=' + formatPnL(msg.data.pnl),
+          });
+          break;
+        case 'log':
+          addLogLine(msg);
+          break;
+        case 'error':
+          addError(msg);
+          addLogLine(msg);
+          break;
+      }
+    };
+  }
+
+  // --- Periodic timer update ---
+  setInterval(function() {
+    if (lastState && lastState.seconds_to_close != null) {
+      lastState.seconds_to_close = Math.max(0, lastState.seconds_to_close - 1);
+      windowTimer.textContent = Math.round(lastState.seconds_to_close) + 's';
+    }
+  }, 1000);
+
+  connect();
+})();
+</script>
+</body>
+</html>
