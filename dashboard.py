@@ -13,13 +13,14 @@ Usage:
 """
 import asyncio
 import base64
-import json
+import hashlib
 import logging
+import secrets
 import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from aiohttp import web
 
@@ -31,6 +32,8 @@ log = logging.getLogger(__name__)
 _LOG_BUFFER_SIZE = 200
 # Maximum queue depth per WebSocket client before dropping messages
 _CLIENT_QUEUE_SIZE = 100
+# WS auth tokens expire after 24 hours
+_WS_TOKEN_TTL = 86400
 
 
 class EventBus:
@@ -116,11 +119,11 @@ class DashboardLogHandler(logging.Handler):
 
 
 # ---------------------------------------------------------------------------
-# aiohttp handlers
+# Authentication
 # ---------------------------------------------------------------------------
 
-def _check_auth(request: web.Request) -> bool:
-    """Return True if request is authorized (or no password is set)."""
+def _check_basic_auth(request: web.Request) -> bool:
+    """Return True if Basic Auth credentials are valid (or no password set)."""
     password = Config.DASHBOARD_PASSWORD
     if not password:
         return True
@@ -129,11 +132,31 @@ def _check_auth(request: web.Request) -> bool:
         return False
     try:
         decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-        # Accept any username, check password only
         _, _, pwd = decoded.partition(":")
         return pwd == password
     except Exception:
         return False
+
+
+def _make_ws_token() -> str:
+    """Generate a short-lived token for WebSocket authentication."""
+    return secrets.token_urlsafe(32)
+
+
+def _check_ws_token(request: web.Request) -> bool:
+    """Validate the WS token passed as ?token= query parameter."""
+    password = Config.DASHBOARD_PASSWORD
+    if not password:
+        return True
+    token = request.query.get("token", "")
+    tokens: dict[str, float] = request.app["ws_tokens"]
+    created = tokens.get(token)
+    if created is None:
+        return False
+    if time.monotonic() - created > _WS_TOKEN_TTL:
+        del tokens[token]
+        return False
+    return True
 
 
 def _auth_response() -> web.Response:
@@ -144,16 +167,33 @@ def _auth_response() -> web.Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# aiohttp handlers
+# ---------------------------------------------------------------------------
+
 async def _handle_index(request: web.Request) -> web.Response:
-    if not _check_auth(request):
+    if not _check_basic_auth(request):
         return _auth_response()
+
     html_path = Path(__file__).parent / "dashboard.html"
-    return web.FileResponse(html_path)
+    html = html_path.read_text(encoding="utf-8")
+
+    # Generate a WS auth token and inject it into the HTML.
+    # The JS reads window.__WS_TOKEN to authenticate the WebSocket upgrade.
+    if Config.DASHBOARD_PASSWORD:
+        token = _make_ws_token()
+        request.app["ws_tokens"][token] = time.monotonic()
+        html = html.replace(
+            "/*__WS_TOKEN_PLACEHOLDER__*/",
+            f'window.__WS_TOKEN = "{token}";',
+        )
+
+    return web.Response(text=html, content_type="text/html")
 
 
 async def _handle_ws(request: web.Request) -> web.WebSocketResponse:
-    if not _check_auth(request):
-        return _auth_response()
+    if not _check_ws_token(request):
+        return web.Response(status=403, text="Forbidden")
 
     ws = web.WebSocketResponse(heartbeat=20.0)
     await ws.prepare(request)
@@ -176,8 +216,6 @@ async def _handle_ws(request: web.Request) -> web.WebSocketResponse:
                 event = await asyncio.wait_for(q.get(), timeout=5.0)
                 await ws.send_json(event)
             except asyncio.TimeoutError:
-                # Send ping to keep alive (handled by heartbeat, but
-                # this ensures we check ws.closed periodically)
                 continue
             except ConnectionResetError:
                 break
@@ -195,6 +233,7 @@ async def start_dashboard(event_bus: EventBus) -> web.AppRunner:
     """Start the dashboard web server. Returns the runner for cleanup."""
     app = web.Application()
     app["event_bus"] = event_bus
+    app["ws_tokens"] = {}  # token -> monotonic timestamp
     app.router.add_get("/", _handle_index)
     app.router.add_get("/ws", _handle_ws)
 

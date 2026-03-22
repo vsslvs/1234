@@ -261,6 +261,7 @@
 </div>
 
 <script>
+  /*__WS_TOKEN_PLACEHOLDER__*/
 (function() {
   const MAX_LOG_LINES = 500;
   const MAX_ERRORS = 50;
@@ -420,7 +421,9 @@
   // --- WebSocket ---
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
+    let wsUrl = proto + '//' + location.host + '/ws';
+    if (window.__WS_TOKEN) wsUrl += '?token=' + encodeURIComponent(window.__WS_TOKEN);
+    ws = new WebSocket(wsUrl);
 
     ws.onopen = function() {
       connBanner.classList.remove('show');

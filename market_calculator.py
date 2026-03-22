@@ -258,7 +258,6 @@ class MarketCalculator:
 
     def get_markets_snapshot(self) -> list[dict]:
         """Return all known markets as dicts with URLs for the dashboard."""
-        now = time.time()
         result = []
         for ws, m in sorted(self._markets.items()):
             slug = f"btc-updown-5m-{m.window_start}"
