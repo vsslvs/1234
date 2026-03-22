@@ -122,6 +122,7 @@ class MarketMaker:
         self._running = False
         self._stats   = BotStats()
         self._windows_since_stats_log = 0
+        self._last_status_log: float = 0.0  # monotonic time of last status log
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -183,6 +184,16 @@ class MarketMaker:
 
         # Only quote during entry window
         if not market.is_entry_window:
+            now = time.monotonic()
+            if now - self._last_status_log >= 30.0:
+                self._last_status_log = now
+                mid = self._ob_ws.book.mid_price
+                stc = market.seconds_to_close
+                p_up = self._calc.p_up_signal(market)
+                log.info(
+                    "Waiting | BTC=%.2f  p_up=%.4f  window_close_in=%.0fs  entry_in=%.0fs",
+                    mid or 0, p_up, stc, max(0, stc - Config.ENTRY_WINDOW_SEC),
+                )
             return
 
         await self._quote_window(state, market)
@@ -217,15 +228,11 @@ class MarketMaker:
     async def _quote_window(self, state: WindowState, market: BtcMarket) -> None:
         """Place or refresh maker orders based on directional signal."""
         # --- Volatility gate -------------------------------------------
-        # Skip trading if the recent Binance 5-minute candle range is extreme.
-        # A high-low range > VOLATILITY_GATE_BPS signals a flash-crash, major
-        # news event, or severely illiquid conditions where the random-walk model
-        # breaks down and EV can turn negative.
         candle_vol = self._ob_ws.candle.volatility_bps
         if candle_vol > Config.VOLATILITY_GATE_BPS:
-            log.debug(
-                "Vol gate: window=%d  candle_vol=%.0f bps > gate=%.0f bps — skip",
-                state.market.window_start, candle_vol, Config.VOLATILITY_GATE_BPS,
+            log.info(
+                "Vol gate SKIP | candle_vol=%.0f bps > gate=%.0f bps",
+                candle_vol, Config.VOLATILITY_GATE_BPS,
             )
             await self._cancel_window(state)
             return
@@ -237,11 +244,14 @@ class MarketMaker:
 
         tasks = []
 
+        log.info(
+            "Entry window | BTC=%.2f  p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  vol=%.0fbps",
+            self._ob_ws.book.mid_price or 0, p_up, fair_yes, fair_no, candle_vol,
+        )
+
         # ----- YES side: buy UP token if strong upside signal -----
         if p_up > P_UP_THRESHOLD:
             target = Config.TARGET_PRICE_YES
-            # BUY edge = (fair - target) × 10000.
-            # Positive means we are buying BELOW our estimated fair value.
             edge = (fair_yes - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
                 # Record entry stats on the FIRST order of this window only
