@@ -44,7 +44,9 @@ from typing import Optional
 
 from config import Config
 from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
-from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
+from polymarket_client import (
+    MakerOrder, OrderCancelledNoReplacement, PolymarketClient, SIDE_BUY,
+)
 from stats import BotStats
 from ws_orderbook import OrderBookWS
 
@@ -131,6 +133,8 @@ class MarketMaker:
         # Circuit breaker: counts consecutive place_maker_order failures.
         # Resets to 0 on the next successful placement.
         self._consecutive_api_errors: int = 0
+        # Background market-refresh task — stored so stop() can cancel it.
+        self._market_refresh_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -147,8 +151,11 @@ class MarketMaker:
             )
         await self._refresh_market_list()
 
-        # Pre-fetch upcoming markets once, then periodically in background
-        asyncio.create_task(self._market_refresh_loop(), name="market-refresh")
+        # Pre-fetch upcoming markets once, then periodically in background.
+        # Store the task reference so stop() can cancel it cleanly.
+        self._market_refresh_task = asyncio.create_task(
+            self._market_refresh_loop(), name="market-refresh"
+        )
 
         interval = Config.QUOTE_REFRESH_MS / 1000
         while self._running:
@@ -162,6 +169,8 @@ class MarketMaker:
 
     async def stop(self) -> None:
         self._running = False
+        if self._market_refresh_task and not self._market_refresh_task.done():
+            self._market_refresh_task.cancel()
         self._stats.log_summary(
             k=K_SIGNAL,
             entry_window_sec=Config.ENTRY_WINDOW_SEC,
@@ -365,10 +374,23 @@ class MarketMaker:
         elif side.price_drifted(target_price):
             # Cancel/replace with new price
             t0 = time.monotonic()
-            new_order = await self._client.cancel_replace(
-                old_order=side.order,
-                new_price=target_price,
-            )
+            try:
+                new_order = await self._client.cancel_replace(
+                    old_order=side.order,
+                    new_price=target_price,
+                )
+            except OrderCancelledNoReplacement:
+                # Cancel succeeded but replacement placement failed.
+                # Old order is no longer on the exchange — clear the reference
+                # so the next tick places a fresh order instead of looping on
+                # a phantom order that can never be cancel/replaced.
+                log.warning(
+                    "cancel_replace %s: old order cancelled but replacement failed"
+                    " — will re-quote next tick", side.side_label,
+                )
+                side.order = None
+                self._consecutive_api_errors += 1
+                return
             elapsed_ms = (time.monotonic() - t0) * 1000
             log.debug(
                 "cancel_replace %s %.4f→%.4f in %.1f ms",
@@ -377,15 +399,21 @@ class MarketMaker:
             if new_order is not None:
                 side.order = new_order
                 self._consecutive_api_errors = 0
-            # else: keep side.order unchanged — old order may still be live
-            # on the exchange if the cancel failed.  Keeping the reference
-            # ensures the next tick retries the cancel/replace instead of
-            # placing a fresh order (which would cause double exposure).
+            else:
+                # Cancel failed — old order may still be live. Keep reference
+                # so next tick retries cancel/replace (not a fresh placement).
+                self._consecutive_api_errors += 1
 
     async def _cancel_side(self, side: MarketSide) -> None:
         if side.order:
-            await self._client.cancel_order(side.order.order_id)
-            side.order = None
+            ok = await self._client.cancel_order(side.order.order_id)
+            if ok:
+                side.order = None
+            else:
+                log.warning(
+                    "cancel_order failed for %s order %s — keeping reference for retry",
+                    side.side_label, side.order.order_id,
+                )
 
     async def _cancel_window(self, state: WindowState) -> None:
         tasks = []

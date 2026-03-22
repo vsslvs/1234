@@ -32,6 +32,18 @@ from config import Config
 
 log = logging.getLogger(__name__)
 
+
+class OrderCancelledNoReplacement(Exception):
+    """
+    Raised by cancel_replace() when the cancel request succeeded but the
+    replacement order could not be placed.
+
+    The old order is NO LONGER live on the exchange.  The caller must clear
+    its local reference to the old order (set side.order = None) so the bot
+    knows it has no active quote and will re-enter on the next tick.
+    """
+
+
 # ---------------------------------------------------------------------------
 # EIP-712 type definitions for Polymarket CLOB order
 # ---------------------------------------------------------------------------
@@ -333,8 +345,18 @@ class PolymarketClient:
         if elapsed_ms > Config.CANCEL_REPLACE_TIMEOUT_MS:
             log.warning("cancel_replace took %.1f ms (budget=%d ms)", elapsed_ms, Config.CANCEL_REPLACE_TIMEOUT_MS)
 
+        # Determine cancel outcome BEFORE checking place, so we can distinguish
+        # "cancel-ok + place-fail" from "cancel-fail + place-fail".
+        cancel_succeeded = isinstance(cancel_ok, bool) and cancel_ok
+
         if isinstance(new_order_or_exc, Exception):
             log.error("cancel_replace place failed: %s", new_order_or_exc)
+            if cancel_succeeded:
+                # Old order was removed from the exchange but replacement failed.
+                # Raise so the caller knows to clear its stale order reference —
+                # retaining it would cause the bot to believe it has an active quote
+                # when it does not, preventing re-entry for the rest of the window.
+                raise OrderCancelledNoReplacement(str(new_order_or_exc))
             return None
 
         new_order: MakerOrder = new_order_or_exc
@@ -344,7 +366,6 @@ class PolymarketClient:
         # the newly placed one. Abort by cancelling the new order immediately to
         # prevent double exposure. The caller keeps old_order as the active order
         # and will retry on the next tick.
-        cancel_succeeded = isinstance(cancel_ok, bool) and cancel_ok
         if not cancel_succeeded:
             log.warning(
                 "cancel_replace: cancel of %s failed (%s) — aborting new order %s "
@@ -389,8 +410,9 @@ class PolymarketClient:
         if not orders:
             return
         tasks = [
-            self.cancel_order(o.get("id") or o.get("orderID", ""))
+            self.cancel_order(oid)
             for o in orders
+            if (oid := (o.get("id") or o.get("orderID", "")))
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         cancelled = sum(1 for r in results if r is True)
@@ -411,17 +433,21 @@ class PolymarketClient:
         Returns False if the endpoint explicitly reports missing approvals
                       (caller should halt trading immediately).
         """
-        async with self._session.get(
-            "/auth/approvals",
-            params={"address": self._maker_address},
-        ) as r:
-            if r.status != 200:
-                log.warning(
-                    "Could not verify approvals (status %s) — proceeding",
-                    r.status,
-                )
-                return True   # endpoint unavailable; don't block startup
-            data = await r.json()
+        try:
+            async with self._session.get(
+                "/auth/approvals",
+                params={"address": self._maker_address},
+            ) as r:
+                if r.status != 200:
+                    log.warning(
+                        "Could not verify approvals (status %s) — proceeding",
+                        r.status,
+                    )
+                    return True   # endpoint unavailable; don't block startup
+                data = await r.json()
+        except Exception as exc:
+            log.warning("check_approvals network error: %s — proceeding", exc)
+            return True   # unreachable; don't block startup
 
         usdc_ok  = bool(data.get("usdcApproved", False))
         token_ok = bool(data.get("conditionalTokenApproved", False))
