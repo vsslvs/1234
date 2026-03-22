@@ -144,7 +144,17 @@ cd <repo-dir>
 pip install -r requirements.txt
 ```
 
-### 2. Создание файла `.env`
+### 2. Настройка файла `.env`
+
+**Рекомендуемый способ — интерактивный помощник:**
+
+```bash
+python3 setup.py
+```
+
+Скрипт проведёт через все параметры на русском языке с подсказками и валидацией.
+
+**Или вручную:**
 
 ```bash
 cp .env.example .env
@@ -355,6 +365,7 @@ sudo journalctl -u btc-mm -f
 ├── market_maker.py         Торговый цикл: tick → quote → cancel/replace
 ├── polymarket_client.py    CLOB REST: EIP-712 подпись и размещение ордеров
 ├── stats.py                Трекер win rate, P&L, теоретический EV
+├── setup.py                Интерактивный помощник настройки (на русском)
 ├── requirements.txt        Python-зависимости
 ├── .env.example            Шаблон конфигурации
 └── REVIEW_HISTORY.md       История ревью кода и аудитов
