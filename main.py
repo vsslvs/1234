@@ -31,7 +31,9 @@ import os
 import signal
 import sys
 
+from bot_state import state as dashboard_state
 from config import Config
+from dashboard import start_dashboard
 from market_calculator import MarketCalculator
 from market_maker import MarketMaker
 from polymarket_client import PolymarketClient
@@ -50,11 +52,12 @@ def _setup_logging() -> None:
 async def _main() -> None:
     _setup_logging()
     log = logging.getLogger("main")
-    log.info(
-        "BTC 5m market maker starting | wallet=%s...%s",
-        Config.PRIVATE_KEY[:6],
-        Config.PRIVATE_KEY[-4:],
-    )
+    wallet_short = Config.PRIVATE_KEY[:6] + "..." + Config.PRIVATE_KEY[-4:]
+    log.info("BTC 5m market maker starting | wallet=%s", wallet_short)
+    dashboard_state.wallet = wallet_short
+
+    # Web dashboard
+    dash_runner = await start_dashboard()
 
     # Binance WS for live BTC price feed
     ob_ws = OrderBookWS()
@@ -100,6 +103,7 @@ async def _main() -> None:
             except asyncio.CancelledError:
                 pass
 
+    await dash_runner.cleanup()
     log.info("Shutdown complete")
 
 

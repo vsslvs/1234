@@ -42,6 +42,7 @@ import logging
 import time
 from typing import Dict, Optional
 
+from bot_state import state as dashboard_state, TradeSnapshot
 from config import Config
 from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
@@ -177,13 +178,23 @@ class MarketMaker:
         if state is None:
             return
 
-        # Exit window: cancel everything and wait for resolution
+        # Determine phase and update dashboard
         if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
+            phase = "exit"
+        elif market.is_entry_window:
+            phase = "entry"
+        else:
+            phase = "waiting"
+
+        self._update_dashboard(market, state, phase)
+
+        # Exit window: cancel everything and wait for resolution
+        if phase == "exit":
             await self._cancel_window(state)
             return
 
         # Only quote during entry window
-        if not market.is_entry_window:
+        if phase == "waiting":
             now = time.monotonic()
             if now - self._last_status_log >= 30.0:
                 self._last_status_log = now
@@ -197,6 +208,34 @@ class MarketMaker:
             return
 
         await self._quote_window(state, market)
+
+    def _update_dashboard(self, market: BtcMarket, state: WindowState, phase: str) -> None:
+        """Push current state to the shared dashboard object."""
+        mid = self._ob_ws.book.mid_price or 0.0
+        p_up = self._calc.p_up_signal(market)
+
+        ds = dashboard_state
+        ds.btc_price = mid
+        ds.btc_open_price = market.open_price or 0.0
+        ds.p_up = p_up
+        ds.fair_yes = p_up
+        ds.fair_no = 1.0 - p_up
+        ds.candle_vol_bps = self._ob_ws.candle.volatility_bps
+        ds.window_start = market.window_start
+        ds.window_end = market.window_end
+        ds.seconds_to_close = market.seconds_to_close
+        ds.phase = phase
+        ds.yes_order_active = state.yes.has_order
+        ds.no_order_active = state.no.has_order
+        ds.yes_order_price = state.yes.order.price if state.yes.order else 0.0
+        ds.no_order_price = state.no.order.price if state.no.order else 0.0
+        ds.total_trades = self._stats.total_trades
+        ds.wins = self._stats._wins
+        ds.losses = self._stats._losses
+        ds.total_pnl = self._stats.total_pnl
+        ds.win_rate = self._stats.win_rate or 0.0
+        ds.rolling_win_rate = self._stats.rolling_win_rate() or 0.0
+        ds.last_update = time.time()
 
     async def _rollover(self, new_market: BtcMarket) -> None:
         """Clean up old window, evaluate its outcome, set up new window state."""
@@ -316,6 +355,22 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
+            # Push to dashboard
+            shares = Config.ORDER_SIZE_USDC / side.last_entry_price
+            pnl = shares * (1.0 - side.last_entry_price) if won else -Config.ORDER_SIZE_USDC
+            dashboard_state.recent_trades.append(TradeSnapshot(
+                timestamp=time.time(),
+                window_start=market.window_start,
+                side=side.side_label,
+                entry_price=side.last_entry_price,
+                size_usdc=Config.ORDER_SIZE_USDC,
+                p_signal=side.p_signal_at_entry,
+                won=won,
+                pnl=pnl,
+            ))
+            # Keep only last 50
+            if len(dashboard_state.recent_trades) > 50:
+                dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
 
     # ------------------------------------------------------------------
     # Order helpers
