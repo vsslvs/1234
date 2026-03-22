@@ -29,6 +29,8 @@ class BotState:
     # Connection
     started_at: float = field(default_factory=time.time)
     wallet: str = ""
+    paper_trading: bool = False
+    paper_balance: float = 0.0
 
     # Market
     btc_price: float = 0.0
@@ -70,6 +72,8 @@ class BotState:
         return {
             "uptime_seconds": round(uptime, 1),
             "wallet": self.wallet,
+            "paper_trading": self.paper_trading,
+            "paper_balance": round(self.paper_balance, 2),
             "btc_price": round(self.btc_price, 2),
             "btc_open_price": round(self.btc_open_price, 2),
             "p_up": round(self.p_up, 4),

@@ -36,6 +36,7 @@ from config import Config
 from dashboard import start_dashboard
 from market_calculator import MarketCalculator
 from market_maker import MarketMaker
+from paper_client import PaperClient
 from polymarket_client import PolymarketClient
 from ws_orderbook import OrderBookWS
 
@@ -53,8 +54,10 @@ async def _main() -> None:
     _setup_logging()
     log = logging.getLogger("main")
     wallet_short = Config.PRIVATE_KEY[:6] + "..." + Config.PRIVATE_KEY[-4:]
-    log.info("BTC 5m market maker starting | wallet=%s", wallet_short)
+    mode = "PAPER" if Config.PAPER_TRADING else "LIVE"
+    log.info("BTC 5m market maker starting | %s mode | wallet=%s", mode, wallet_short)
     dashboard_state.wallet = wallet_short
+    dashboard_state.paper_trading = Config.PAPER_TRADING
 
     # Web dashboard
     dash_runner = await start_dashboard()
@@ -73,7 +76,8 @@ async def _main() -> None:
 
     log.info("BTC mid-price: %.2f", ob_ws.book.mid_price or 0)
 
-    async with PolymarketClient() as client:
+    client_cm = PaperClient() if Config.PAPER_TRADING else PolymarketClient()
+    async with client_cm as client:
         async with MarketCalculator(ob_ws) as calc:
             mm = MarketMaker(client, calc, ob_ws)
 

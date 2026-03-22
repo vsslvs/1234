@@ -236,6 +236,9 @@ class MarketMaker:
         ds.total_pnl = self._stats.total_pnl
         ds.win_rate = self._stats.win_rate or 0.0
         ds.rolling_win_rate = self._stats.rolling_win_rate() or 0.0
+        # Paper balance
+        if hasattr(self._client, 'balance'):
+            ds.paper_balance = self._client.balance
         ds.last_update = time.time()
 
     async def _rollover(self, new_market: BtcMarket) -> None:
@@ -359,6 +362,9 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
+            # Resolve paper trade balance
+            if hasattr(self._client, 'resolve_trade'):
+                self._client.resolve_trade(won, Config.ORDER_SIZE_USDC, side.last_entry_price)
             # Push to dashboard
             shares = Config.ORDER_SIZE_USDC / side.last_entry_price
             pnl = shares * (1.0 - side.last_entry_price) if won else -Config.ORDER_SIZE_USDC

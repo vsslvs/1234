@@ -72,6 +72,12 @@ HTML_PAGE = """\
   .pnl-pos { color: #40c057; }
   .pnl-neg { color: #ff6b6b; }
 
+  .paper-banner {
+    background: #3d2e00; border: 1px solid #ffc107; border-radius: 8px;
+    padding: 10px 16px; margin-bottom: 16px; color: #ffc107;
+    font-weight: 600; text-align: center; font-size: 0.9em;
+  }
+
   .progress-ring {
     width: 60px; height: 60px; display: inline-block;
   }
@@ -84,6 +90,8 @@ HTML_PAGE = """\
 <body>
 
 <h1>Polymarket BTC 5m Market Maker</h1>
+
+<div id="paper-banner" class="paper-banner" style="display:none;">PAPER TRADING — виртуальный баланс: <span id="paper-bal">--</span> USDC</div>
 
 <div class="status-bar">
   <span id="conn-dot" class="dot-ok"></span>
@@ -175,6 +183,14 @@ async function refresh() {
     const d = await r.json();
 
     $('conn-dot').className = 'dot-ok';
+
+    // Paper trading banner
+    if (d.paper_trading) {
+      $('paper-banner').style.display = 'block';
+      $('paper-bal').textContent = fmt(d.paper_balance, 2);
+    } else {
+      $('paper-banner').style.display = 'none';
+    }
 
     // Uptime
     const mins = Math.floor(d.uptime_seconds / 60);

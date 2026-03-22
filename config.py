@@ -59,6 +59,10 @@ class Config:
     MARKET_WINDOW_SEC: int = 300
     MARKETS_PER_DAY: int = 288
 
+    # Paper trading (dry run with virtual balance, no real orders)
+    PAPER_TRADING: bool = _get("PAPER_TRADING", "true", lambda v: v.lower() in ("true", "1", "yes"))
+    PAPER_BALANCE_USDC: float = _get("PAPER_BALANCE_USDC", "1000", float)
+
     # Polygon chain ID (Polymarket runs on Polygon PoS)
     CHAIN_ID: int = 137
 
