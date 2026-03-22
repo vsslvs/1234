@@ -124,6 +124,7 @@ class MarketMaker:
         self._stats   = BotStats()
         self._windows_since_stats_log = 0
         self._last_status_log: float = 0.0  # monotonic time of last status log
+        self._last_entry_log: float = 0.0   # monotonic time of last entry window log
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -283,10 +284,13 @@ class MarketMaker:
 
         tasks = []
 
-        log.info(
-            "Entry window | BTC=%.2f  p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  vol=%.0fbps",
-            self._ob_ws.book.mid_price or 0, p_up, fair_yes, fair_no, candle_vol,
-        )
+        now = time.monotonic()
+        if now - self._last_entry_log >= 2.0:
+            self._last_entry_log = now
+            log.info(
+                "Entry window | BTC=%.2f  p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  vol=%.0fbps",
+                self._ob_ws.book.mid_price or 0, p_up, fair_yes, fair_no, candle_vol,
+            )
 
         # ----- YES side: buy UP token if strong upside signal -----
         if p_up > P_UP_THRESHOLD:
