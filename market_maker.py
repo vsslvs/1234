@@ -269,12 +269,7 @@ class MarketMaker:
             # Positive means we are buying BELOW our estimated fair value.
             edge = (fair_yes - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
-                # Record entry stats on the FIRST order of this window only
-                if not state.yes.was_ever_active:
-                    state.yes.p_signal_at_entry = p_up
-                    state.yes.last_entry_price  = target
-                    state.yes.was_ever_active   = True
-                tasks.append(self._refresh_side(state.yes, target))
+                tasks.append(self._refresh_side(state.yes, target, p_signal=p_up))
         else:
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
@@ -285,11 +280,7 @@ class MarketMaker:
             # BUY edge for NO: (fair_no - target) × 10000
             edge = (fair_no - target) * 10_000
             if edge >= Config.MIN_EDGE_BPS:
-                if not state.no.was_ever_active:
-                    state.no.p_signal_at_entry = p_up
-                    state.no.last_entry_price  = target
-                    state.no.was_ever_active   = True
-                tasks.append(self._refresh_side(state.no, target))
+                tasks.append(self._refresh_side(state.no, target, p_signal=p_up))
         else:
             if state.no.has_order:
                 tasks.append(self._cancel_side(state.no))
@@ -336,7 +327,9 @@ class MarketMaker:
     # Order helpers
     # ------------------------------------------------------------------
 
-    async def _refresh_side(self, side: MarketSide, target_price: float) -> None:
+    async def _refresh_side(
+        self, side: MarketSide, target_price: float, p_signal: float = 0.5
+    ) -> None:
         """Place a new order or cancel/replace if price drifted."""
         if not side.has_order:
             # Guard: enforce MAX_EXPOSURE_USDC before committing more capital.
@@ -359,6 +352,13 @@ class MarketMaker:
                 )
                 side.order = order
                 self._consecutive_api_errors = 0   # reset circuit breaker on success
+                # Record entry stats ONLY after confirmed placement (not before),
+                # so _evaluate_and_record_window never records a trade that was
+                # never actually placed.
+                if not side.was_ever_active:
+                    side.p_signal_at_entry = p_signal
+                    side.last_entry_price  = target_price
+                    side.was_ever_active   = True
             except Exception as exc:
                 log.error("place_maker_order %s failed: %s", side.side_label, exc)
                 self._consecutive_api_errors += 1

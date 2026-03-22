@@ -66,3 +66,33 @@ class Config:
     EXCHANGE_ADDRESS: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
     CONDITIONAL_TOKEN_ADDRESS: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
     USDC_ADDRESS: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon
+
+    @classmethod
+    def validate(cls) -> None:
+        """Raise ValueError on obviously wrong config values at startup."""
+        errors = []
+        if cls.ORDER_SIZE_USDC <= 0:
+            errors.append(f"ORDER_SIZE_USDC must be > 0, got {cls.ORDER_SIZE_USDC}")
+        if cls.MAX_EXPOSURE_USDC < cls.ORDER_SIZE_USDC:
+            errors.append(
+                f"MAX_EXPOSURE_USDC ({cls.MAX_EXPOSURE_USDC}) must be >= "
+                f"ORDER_SIZE_USDC ({cls.ORDER_SIZE_USDC})"
+            )
+        if cls.QUOTE_REFRESH_MS <= 0:
+            errors.append(f"QUOTE_REFRESH_MS must be > 0, got {cls.QUOTE_REFRESH_MS}")
+        if cls.ENTRY_WINDOW_SEC <= 0 or cls.ENTRY_WINDOW_SEC >= cls.MARKET_WINDOW_SEC:
+            errors.append(
+                f"ENTRY_WINDOW_SEC must be in (0, {cls.MARKET_WINDOW_SEC}), "
+                f"got {cls.ENTRY_WINDOW_SEC}"
+            )
+        if cls.EXIT_WINDOW_SEC <= 0 or cls.EXIT_WINDOW_SEC >= cls.ENTRY_WINDOW_SEC:
+            errors.append(
+                f"EXIT_WINDOW_SEC must be in (0, {cls.ENTRY_WINDOW_SEC}), "
+                f"got {cls.EXIT_WINDOW_SEC}"
+            )
+        if not (0 < cls.TARGET_PRICE_YES < 1):
+            errors.append(f"TARGET_PRICE_YES must be in (0, 1), got {cls.TARGET_PRICE_YES}")
+        if not (0 < cls.TARGET_PRICE_NO < 1):
+            errors.append(f"TARGET_PRICE_NO must be in (0, 1), got {cls.TARGET_PRICE_NO}")
+        if errors:
+            raise ValueError("Invalid configuration:\n" + "\n".join(f"  • {e}" for e in errors))

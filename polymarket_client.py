@@ -353,7 +353,18 @@ class PolymarketClient:
                 cancel_ok,
                 new_order.order_id,
             )
-            await self.cancel_order(new_order.order_id)
+            abort_ok = await self.cancel_order(new_order.order_id)
+            if not abort_ok:
+                # Could not abort the new order either — it is live on exchange.
+                # Return new_order so the caller can track it (prevents ghost order).
+                # Old order may also still be live; it will expire or fill at old price.
+                log.critical(
+                    "cancel_replace: FAILED to abort new order %s — returning it "
+                    "to caller to prevent ghost order; old order %s may also be live",
+                    new_order.order_id,
+                    old_order.order_id,
+                )
+                return new_order
             return None
 
         log.debug("cancel_replace completed in %.1f ms", elapsed_ms)

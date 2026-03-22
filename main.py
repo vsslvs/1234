@@ -50,6 +50,7 @@ def _setup_logging() -> None:
 async def _main() -> None:
     _setup_logging()
     log = logging.getLogger("main")
+    Config.validate()   # fail-fast on misconfigured .env values
     log.info(
         "BTC 5m market maker starting | wallet=%s...%s",
         Config.PRIVATE_KEY[:6],
@@ -60,13 +61,14 @@ async def _main() -> None:
     ob_ws = OrderBookWS()
     ws_task = asyncio.create_task(ob_ws.run(), name="binance-ws")
 
-    # Wait briefly for first order book snapshot
-    for _ in range(20):
+    # Wait up to 6 s for first order book snapshot (Binance WS handshake + first message).
+    # 20 × 0.1 s was too short on slow networks; 60 × 0.1 s = 6 s is a safer budget.
+    for _ in range(60):
         if ob_ws.book.mid_price is not None:
             break
         await asyncio.sleep(0.1)
     if ob_ws.book.mid_price is None:
-        log.warning("Binance WS connected but no price yet — proceeding anyway")
+        log.warning("Binance WS connected but no price yet after 6 s — proceeding anyway")
 
     log.info("BTC mid-price: %.2f", ob_ws.book.mid_price or 0)
 
