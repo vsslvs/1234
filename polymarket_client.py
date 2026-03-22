@@ -366,7 +366,11 @@ class PolymarketClient:
 
     async def cancel_all_orders(self) -> None:
         """Cancel every open order for this account (called on shutdown)."""
-        orders = await self.get_open_orders()
+        try:
+            orders = await self.get_open_orders()
+        except Exception as exc:
+            log.warning("Could not fetch open orders on shutdown: %s", exc)
+            return
         if not orders:
             return
         tasks = [
