@@ -274,7 +274,7 @@ async def start_dashboard(port: int = DASHBOARD_PORT) -> web.AppRunner:
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "127.0.0.1", port)
     await site.start()
-    log.info("Dashboard running at http://0.0.0.0:%d", port)
+    log.info("Dashboard running at http://127.0.0.1:%d", port)
     return runner
