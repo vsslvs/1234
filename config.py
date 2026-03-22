@@ -59,6 +59,11 @@ class Config:
     MARKET_WINDOW_SEC: int = 300
     MARKETS_PER_DAY: int = 288
 
+    # Dashboard
+    DASHBOARD_PORT: int = _get("DASHBOARD_PORT", "8080", int)
+    DASHBOARD_HOST: str = _get("DASHBOARD_HOST", "0.0.0.0")
+    DASHBOARD_PASSWORD: str = _get("DASHBOARD_PASSWORD", "")
+
     # Polygon chain ID (Polymarket runs on Polygon PoS)
     CHAIN_ID: int = 137
 

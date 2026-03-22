@@ -256,6 +256,31 @@ class MarketCalculator:
     # Current market
     # ------------------------------------------------------------------
 
+    def get_markets_snapshot(self) -> list[dict]:
+        """Return all known markets as dicts with URLs for the dashboard."""
+        now = time.time()
+        result = []
+        for ws, m in sorted(self._markets.items()):
+            slug = f"btc-updown-5m-{m.window_start}"
+            sec = m.seconds_to_close
+            if m.is_expired:
+                status = "expired"
+            elif m.is_entry_window:
+                status = "entry"
+            elif sec > 0:
+                status = "active" if ws == current_window_start() else "upcoming"
+            else:
+                status = "expired"
+            result.append({
+                "window_start": m.window_start,
+                "window_end": m.window_end,
+                "slug": slug,
+                "url": f"https://polymarket.com/event/{slug}",
+                "status": status,
+                "seconds_to_close": round(sec, 0),
+            })
+        return result
+
     def current_market(self) -> Optional[BtcMarket]:
         """Return the market for the current 5-minute window, if known."""
         ws = current_window_start()

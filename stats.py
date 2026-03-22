@@ -48,7 +48,7 @@ import logging
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Deque, Optional
 
 log = logging.getLogger(__name__)
@@ -242,6 +242,19 @@ class BotStats:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Export current statistics as a plain dict for the dashboard."""
+        return {
+            "wins": self._wins,
+            "losses": self._losses,
+            "total_pnl": round(self._total_pnl, 2),
+            "win_rate": self.win_rate,
+            "rolling_win_rate": self.rolling_win_rate(),
+            "avg_pnl": round(self.avg_pnl_per_trade, 2) if self.avg_pnl_per_trade else None,
+            "total_trades": self.total_trades,
+            "recent_trades": [asdict(t) for t in list(self._trades)[-20:]],
+        }
 
     def log_summary(
         self,

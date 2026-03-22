@@ -32,6 +32,7 @@ import signal
 import sys
 
 from config import Config
+from dashboard import DashboardLogHandler, EventBus, start_dashboard
 from market_calculator import MarketCalculator
 from market_maker import MarketMaker
 from polymarket_client import PolymarketClient
@@ -50,6 +51,16 @@ def _setup_logging() -> None:
 async def _main() -> None:
     _setup_logging()
     log = logging.getLogger("main")
+
+    # Set up dashboard event bus and logging handler
+    event_bus = EventBus()
+    dash_handler = DashboardLogHandler(event_bus)
+    dash_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(dash_handler)
+
+    # Start dashboard web server
+    dash_runner = await start_dashboard(event_bus)
+
     log.info(
         "BTC 5m market maker starting | wallet=%s...%s",
         Config.PRIVATE_KEY[:6],
@@ -72,7 +83,7 @@ async def _main() -> None:
 
     async with PolymarketClient() as client:
         async with MarketCalculator(ob_ws) as calc:
-            mm = MarketMaker(client, calc, ob_ws)
+            mm = MarketMaker(client, calc, ob_ws, event_bus=event_bus)
 
             loop = asyncio.get_running_loop()
             stop_event = asyncio.Event()
@@ -100,6 +111,7 @@ async def _main() -> None:
             except asyncio.CancelledError:
                 pass
 
+    await dash_runner.cleanup()
     log.info("Shutdown complete")
 
 
