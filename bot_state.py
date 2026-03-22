@@ -52,6 +52,10 @@ class BotState:
     yes_order_price: float = 0.0
     no_order_price: float = 0.0
 
+    # Polymarket market prices (best ask from CLOB orderbook)
+    market_yes_ask: Optional[float] = None
+    market_no_ask: Optional[float] = None
+
     # Stats
     total_trades: int = 0
     wins: int = 0
@@ -88,6 +92,8 @@ class BotState:
             "no_order_active": self.no_order_active,
             "yes_order_price": round(self.yes_order_price, 4),
             "no_order_price": round(self.no_order_price, 4),
+            "market_yes_ask": round(self.market_yes_ask, 4) if self.market_yes_ask is not None else None,
+            "market_no_ask": round(self.market_no_ask, 4) if self.market_no_ask is not None else None,
             "total_trades": self.total_trades,
             "wins": self.wins,
             "losses": self.losses,

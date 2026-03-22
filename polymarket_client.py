@@ -120,6 +120,36 @@ class PolymarketClient:
             await self._session.close()
 
     # ------------------------------------------------------------------
+    # Orderbook — best bid/ask from CLOB
+    # ------------------------------------------------------------------
+
+    async def get_best_prices(self, token_id: str) -> dict:
+        """
+        GET /book?token_id={token_id}
+        Returns {"best_bid": float|None, "best_ask": float|None}.
+        """
+        try:
+            async with self._session.get("/book", params={"token_id": token_id}) as r:
+                r.raise_for_status()
+                data = await r.json()
+
+            best_bid = None
+            best_ask = None
+
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            if bids:
+                best_bid = max(float(b["price"]) for b in bids)
+            if asks:
+                best_ask = min(float(a["price"]) for a in asks)
+
+            return {"best_bid": best_bid, "best_ask": best_ask}
+        except Exception as exc:
+            log.warning("get_best_prices failed for %s: %s", token_id[:8], exc)
+            return {"best_bid": None, "best_ask": None}
+
+    # ------------------------------------------------------------------
     # Fee rates — always fetched fresh before signing
     # ------------------------------------------------------------------
 

@@ -143,6 +143,7 @@ HTML_PAGE = """\
       <div class="metric-sm">YES: <span id="order-yes">--</span></div>
       <div class="metric-sm">NO: <span id="order-no">--</span></div>
     </div>
+    <div class="sub" style="margin-top:8px;">Market ask — YES: <span id="mkt-yes-ask">--</span> | NO: <span id="mkt-no-ask">--</span></div>
   </div>
 
   <!-- P&L -->
@@ -245,6 +246,8 @@ async function refresh() {
     $('order-yes').style.color = d.yes_order_active ? '#40c057' : '#484f58';
     $('order-no').textContent = d.no_order_active ? fmt(d.no_order_price, 4) : 'none';
     $('order-no').style.color = d.no_order_active ? '#40c057' : '#484f58';
+    $('mkt-yes-ask').textContent = d.market_yes_ask != null ? fmt(d.market_yes_ask, 4) : '--';
+    $('mkt-no-ask').textContent = d.market_no_ask != null ? fmt(d.market_no_ask, 4) : '--';
 
     // P&L
     const pnlEl = $('pnl');

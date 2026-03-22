@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import aiohttp
+
 from config import Config
 from polymarket_client import MakerOrder, SIDE_BUY
 
@@ -28,8 +30,13 @@ class PaperClient:
         self._open_orders: Dict[str, MakerOrder] = {}
         self._filled_orders: List[MakerOrder] = []
         self._total_pnl: float = 0.0
+        self._http: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
+        self._http = aiohttp.ClientSession(
+            base_url=Config.CLOB_API_URL,
+            timeout=aiohttp.ClientTimeout(total=5.0),
+        )
         log.info(
             "PAPER TRADING mode | virtual balance: %.2f USDC",
             self.balance,
@@ -37,6 +44,8 @@ class PaperClient:
         return self
 
     async def __aexit__(self, *_):
+        if self._http and not self._http.closed:
+            await self._http.close()
         log.info(
             "Paper session ended | balance: %.2f USDC | P&L: %+.2f USDC | trades: %d",
             self.balance,
@@ -124,6 +133,27 @@ class PaperClient:
         if token_id:
             orders = [o for o in orders if o.token_id == token_id]
         return [{"id": o.order_id, "tokenID": o.token_id} for o in orders]
+
+    async def get_best_prices(self, token_id: str) -> dict:
+        """Fetch real best bid/ask from Polymarket CLOB (needed even in paper mode)."""
+        try:
+            async with self._http.get("/book", params={"token_id": token_id}) as r:
+                r.raise_for_status()
+                data = await r.json()
+
+            best_bid = None
+            best_ask = None
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if bids:
+                best_bid = max(float(b["price"]) for b in bids)
+            if asks:
+                best_ask = min(float(a["price"]) for a in asks)
+
+            return {"best_bid": best_bid, "best_ask": best_ask}
+        except Exception as exc:
+            log.warning("get_best_prices failed for %s: %s", token_id[:8], exc)
+            return {"best_bid": None, "best_ask": None}
 
     def resolve_trade(self, won: bool, size_usdc: float, entry_price: float) -> float:
         """

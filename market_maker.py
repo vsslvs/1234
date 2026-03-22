@@ -299,42 +299,76 @@ class MarketMaker:
         fair_yes, fair_no = self._calc.fair_prices(market)
         p_up = fair_yes
 
+        # --- Fetch real Polymarket best ask prices ----------------------
+        # We buy outcome tokens, so the relevant price is the best ask.
+        # Fetch both sides concurrently to minimise latency.
+        yes_prices, no_prices = await asyncio.gather(
+            self._client.get_best_prices(state.yes.token_id),
+            self._client.get_best_prices(state.no.token_id),
+        )
+        yes_best_ask = yes_prices.get("best_ask")
+        no_best_ask = no_prices.get("best_ask")
+
+        # Update dashboard with market prices
+        ds = dashboard_state
+        ds.market_yes_ask = yes_best_ask
+        ds.market_no_ask = no_best_ask
+
         tasks = []
 
         now = time.monotonic()
         if now - self._last_entry_log >= 2.0:
             self._last_entry_log = now
             log.info(
-                "Entry window | BTC=%.2f  p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  vol=%.0fbps",
-                self._ob_ws.book.mid_price or 0, p_up, fair_yes, fair_no, candle_vol,
+                "Entry window | BTC=%.2f  p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  "
+                "mkt_yes_ask=%s  mkt_no_ask=%s  vol=%.0fbps",
+                self._ob_ws.book.mid_price or 0, p_up, fair_yes, fair_no,
+                f"{yes_best_ask:.4f}" if yes_best_ask else "N/A",
+                f"{no_best_ask:.4f}" if no_best_ask else "N/A",
+                candle_vol,
             )
 
         # ----- YES side: buy UP token if strong upside signal -----
         if p_up > P_UP_THRESHOLD:
-            target = Config.TARGET_PRICE_YES
-            edge = (fair_yes - target) * 10_000
-            if edge >= Config.MIN_EDGE_BPS:
-                # Record entry stats on the FIRST order of this window only
-                if not state.yes.was_ever_active:
-                    state.yes.p_signal_at_entry = p_up
-                    state.yes.last_entry_price  = target
-                    state.yes.was_ever_active   = True
-                tasks.append(self._refresh_side(state.yes, target))
+            if yes_best_ask is None:
+                log.debug("YES: no ask available on Polymarket — skipping")
+            else:
+                # Use real market ask as entry price (capped at TARGET_PRICE)
+                target = min(yes_best_ask, Config.TARGET_PRICE_YES)
+                edge = (fair_yes - target) * 10_000
+                if edge >= Config.MIN_EDGE_BPS:
+                    if not state.yes.was_ever_active:
+                        state.yes.p_signal_at_entry = p_up
+                        state.yes.last_entry_price  = target
+                        state.yes.was_ever_active   = True
+                    tasks.append(self._refresh_side(state.yes, target))
+                else:
+                    log.debug(
+                        "YES: insufficient edge %.0f bps (ask=%.4f, fair=%.4f)",
+                        edge, target, fair_yes,
+                    )
         else:
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
 
         # ----- NO side: buy DOWN token if strong downside signal -----
         if p_up < P_DOWN_THRESHOLD:
-            target = Config.TARGET_PRICE_NO
-            # BUY edge for NO: (fair_no - target) × 10000
-            edge = (fair_no - target) * 10_000
-            if edge >= Config.MIN_EDGE_BPS:
-                if not state.no.was_ever_active:
-                    state.no.p_signal_at_entry = p_up
-                    state.no.last_entry_price  = target
-                    state.no.was_ever_active   = True
-                tasks.append(self._refresh_side(state.no, target))
+            if no_best_ask is None:
+                log.debug("NO: no ask available on Polymarket — skipping")
+            else:
+                target = min(no_best_ask, Config.TARGET_PRICE_NO)
+                edge = (fair_no - target) * 10_000
+                if edge >= Config.MIN_EDGE_BPS:
+                    if not state.no.was_ever_active:
+                        state.no.p_signal_at_entry = p_up
+                        state.no.last_entry_price  = target
+                        state.no.was_ever_active   = True
+                    tasks.append(self._refresh_side(state.no, target))
+                else:
+                    log.debug(
+                        "NO: insufficient edge %.0f bps (ask=%.4f, fair=%.4f)",
+                        edge, target, fair_no,
+                    )
         else:
             if state.no.has_order:
                 tasks.append(self._cancel_side(state.no))
