@@ -137,6 +137,8 @@ class PaperClient:
         else:
             pnl = -size_usdc
 
-        self.balance += size_usdc + pnl  # return stake + profit (or stake - loss)
+        # Only apply the P&L delta here. The stake itself is refunded
+        # separately when cancel_all_orders runs during window rollover.
+        self.balance += pnl
         self._total_pnl += pnl
         return pnl
