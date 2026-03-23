@@ -85,6 +85,7 @@ class OrderBookWS:
         self.candle = Candle5m()
         self._running = False
         self._reconnect_delay = 1.0  # seconds, doubles on each failure
+        self._last_disconnect: float = 0.0  # monotonic time of last disconnect
 
     def _stream_url(self) -> str:
         symbol = Config.BTC_SYMBOL.lower()
@@ -103,6 +104,12 @@ class OrderBookWS:
                 await self._connect()
                 self._reconnect_delay = 1.0  # reset on clean connect
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                # If enough time passed since last disconnect (>60s of stable
+                # connection), reset backoff so a fresh failure starts at 1s.
+                now = time.monotonic()
+                if now - self._last_disconnect > 60.0:
+                    self._reconnect_delay = 1.0
+                self._last_disconnect = now
                 log.warning("WS disconnected: %s – reconnecting in %.1fs", exc, self._reconnect_delay)
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)

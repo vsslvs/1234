@@ -193,6 +193,19 @@ class MarketMaker:
         if state is None:
             return
 
+        # --- Stale data guard --------------------------------------------
+        # If the Binance WS feed hasn't updated for STALE_DATA_MAX_SEC,
+        # the mid-price is outdated.  Skip trading to avoid orders based
+        # on prices that may be minutes (or hours) old.
+        book_age = time.time() - self._ob_ws.book.last_update_ms / 1000
+        if book_age > Config.STALE_DATA_MAX_SEC:
+            if market.is_entry_window:
+                log.warning(
+                    "Stale data SKIP | book age=%.1fs > limit=%.0fs — not trading",
+                    book_age, Config.STALE_DATA_MAX_SEC,
+                )
+            return
+
         # Determine phase and update dashboard
         if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
             phase = "exit"

@@ -45,6 +45,12 @@ class Config:
     # Risk
     MAX_EXPOSURE_USDC: float = _get("MAX_EXPOSURE_USDC", "500", float)
 
+    # Stale data guard: skip trading if the Binance order book hasn't been
+    # updated for more than this many seconds.  Protects against placing
+    # orders based on outdated BTC prices when the WebSocket is disconnected
+    # but the Polymarket API is still reachable.
+    STALE_DATA_MAX_SEC: float = _get("STALE_DATA_MAX_SEC", "5", float)
+
     # Volatility gate: skip trading if the latest 5-minute Binance candle
     # high-low range exceeds this threshold (basis points, relative to close).
     # 200 bps = 2% range.  At σ₅ = 0.22% typical, a 2% range represents
