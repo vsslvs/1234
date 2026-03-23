@@ -122,6 +122,7 @@ class MarketMaker:
         self._windows_since_stats_log = 0
         self._last_status_log: float = 0.0  # monotonic time of last status log
         self._last_entry_log: float = 0.0   # monotonic time of last entry window log
+        self._last_volgate_log: float = 0.0  # monotonic time of last vol-gate log
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -295,10 +296,13 @@ class MarketMaker:
         # --- Volatility gate -------------------------------------------
         candle_vol = self._ob_ws.candle.volatility_bps
         if candle_vol > Config.VOLATILITY_GATE_BPS:
-            log.info(
-                "Vol gate SKIP | candle_vol=%.0f bps > gate=%.0f bps",
-                candle_vol, Config.VOLATILITY_GATE_BPS,
-            )
+            now = time.monotonic()
+            if now - self._last_volgate_log >= 5.0:
+                self._last_volgate_log = now
+                log.info(
+                    "Vol gate SKIP | candle_vol=%.0f bps > gate=%.0f bps",
+                    candle_vol, Config.VOLATILITY_GATE_BPS,
+                )
             await self._cancel_window(state)
             return
 
