@@ -145,8 +145,17 @@ class PolymarketClient:
                 best_ask = min(float(a["price"]) for a in asks)
 
             return {"best_bid": best_bid, "best_ask": best_ask}
+        except aiohttp.ClientResponseError as exc:
+            log.warning(
+                "get_best_prices HTTP %s for %s: %s",
+                exc.status, token_id[:8], exc.message,
+            )
+            return {"best_bid": None, "best_ask": None}
         except Exception as exc:
-            log.warning("get_best_prices failed for %s: %s", token_id[:8], exc)
+            log.warning(
+                "get_best_prices failed for %s: [%s] %s",
+                token_id[:8], type(exc).__name__, exc,
+            )
             return {"best_bid": None, "best_ask": None}
 
     # ------------------------------------------------------------------
