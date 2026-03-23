@@ -9,18 +9,29 @@ Market window boundaries (UTC):
     window_start = window_index * 300
     window_end   = window_start + 300
 
-The token IDs for YES / NO sides of each market can be derived from the
-question text or fetched from the Gamma API. This module provides:
+Signal model (random-walk CDF)
+------------------------------
+We estimate P(BTC closes UP) using the standard normal CDF (Φ):
 
-1. Timing helpers (seconds to window close, is it entry/exit window)
-2. A lightweight Gamma API client to fetch today's market token IDs
-3. A btc_direction_signal() function that estimates probability of UP
-   based on current Binance price vs window-open price
+    p_up = Φ( ret / σ_remaining )
+
+where:
+    ret          = (mid - open) / open          (return so far)
+    σ_remaining  = σ₅ × √(stc / WINDOW_SEC)    (vol of remaining time)
+    σ₅           = Config.SIGMA_5M ≈ 0.22%      (BTC 5-min vol)
+
+This is time-adjusted: the same BTC return gives a MUCH higher p_up
+near the end of the window (less time for reversal) than at the start.
+
+Examples with σ₅ = 0.22%:
+    ret=+0.22%, stc=290s: p_up = Φ(1.02) = 0.846  (moderate confidence)
+    ret=+0.22%, stc= 10s: p_up = Φ(5.47) = 1.000  (near certain)
+    ret=+0.05%, stc= 30s: p_up = Φ(0.72) = 0.764  (mild lean)
 
 Usage:
     calc = MarketCalculator(btc_ws)
-    market = await calc.current_market()
-    p_up = calc.p_up_signal()
+    market = calc.current_market()
+    p_up = calc.p_up_signal(market)
 """
 import asyncio
 import json as _json
@@ -41,16 +52,12 @@ log = logging.getLogger(__name__)
 GAMMA_API = "https://gamma-api.polymarket.com"
 WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 
-# Logistic signal steepness.  Maps BTC return → win probability.
-#
-# k=500 gives nuanced probabilities suitable for two-sided market making:
-#   At 0.22% return (1σ): p_up ≈ 0.75  (not saturated)
-#   At 0.50% return:       p_up ≈ 0.92
-#   At 1.0%  return:       p_up ≈ 0.993
-#
-# This avoids the k=2000 regime where p_up saturates to 0/1 almost
-# immediately, leaving no room for spread-based quoting.
-K_SIGNAL: float = 500.0
+_SQRT2 = math.sqrt(2.0)
+
+
+def _phi(z: float) -> float:
+    """Standard normal CDF: Φ(z) = 0.5 × (1 + erf(z/√2))."""
+    return 0.5 * (1.0 + math.erf(z / _SQRT2))
 
 
 @dataclass
@@ -67,12 +74,6 @@ class BtcMarket:
     @property
     def seconds_to_close(self) -> float:
         return max(0.0, self.window_end - time.time())
-
-    @property
-    def is_entry_window(self) -> bool:
-        """True during the last ENTRY_WINDOW_SEC before close."""
-        s = self.seconds_to_close
-        return Config.EXIT_WINDOW_SEC < s <= Config.ENTRY_WINDOW_SEC
 
     @property
     def is_expired(self) -> bool:
@@ -225,7 +226,6 @@ class MarketCalculator:
                 if not end_str:
                     return None
                 dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                # Round to nearest 5-minute boundary to absorb small timing offsets
                 end_ts   = round(int(dt.timestamp()) / WINDOW_SEC) * WINDOW_SEC
                 start_ts = end_ts - WINDOW_SEC
 
@@ -253,42 +253,48 @@ class MarketCalculator:
         return self._markets.get(ws)
 
     # ------------------------------------------------------------------
-    # Directional signal
+    # Directional signal (time-adjusted)
     # ------------------------------------------------------------------
 
     def p_up_signal(self, market: BtcMarket) -> float:
         """
         Estimate P(BTC closes UP) for the current window.
 
-        Method: compare current mid-price to the window-open price.
-        - If we don't have the window-open price yet, record it now.
-        - Return a probability in [0, 1] using a logistic curve on the
-          return magnitude, tuned so that ±0.3% move → ~85% confidence.
+        Uses a random-walk model:
+            p_up = Φ( ret / σ_remaining )
 
-        This is a simple signal. In production you would blend this with
-        order-flow imbalance, vol surface, etc.
+        where σ_remaining = σ₅ × √(seconds_to_close / 300).
+        The same BTC return gives HIGHER p_up near close (less time
+        for reversal) — this is the key improvement over a fixed-K logistic.
         """
         mid = self._ob_ws.book.mid_price
         if mid is None:
             return 0.5
 
         if market.open_price is None:
-            # Use the Binance 5-minute candle open as the window reference price.
-            # Binance 5m candles share the same UTC-based grid as Polymarket 5m windows
-            # (both align to multiples of 300 seconds), so candle.open is the BTC price
-            # at window_start — exactly what the signal needs.
-            # Fallback to mid only if kline data is unavailable (e.g. at startup).
             candle_open = self._ob_ws.candle.open
             market.open_price = candle_open if candle_open > 0 else mid
 
         ret = (mid - market.open_price) / market.open_price
-        p_up = 1.0 / (1.0 + math.exp(-K_SIGNAL * ret))
-        return p_up
+
+        stc = market.seconds_to_close
+        if stc <= 0.5:
+            # Window essentially closed — return certainty
+            return 1.0 if ret > 0 else (0.0 if ret < 0 else 0.5)
+
+        sigma_remaining = Config.SIGMA_5M * math.sqrt(stc / WINDOW_SEC)
+        if sigma_remaining < 1e-10:
+            return 0.5
+
+        z = ret / sigma_remaining
+        # Clamp z to avoid extreme probabilities that cause numerical issues
+        z = max(-6.0, min(6.0, z))
+        return _phi(z)
 
     def fair_prices(self, market: BtcMarket) -> tuple[float, float]:
         """
         Returns (fair_yes, fair_no) based on directional signal.
-        fair_yes + fair_no should equal ~1.0.
+        fair_yes + fair_no = 1.0.
         """
         p_up = self.p_up_signal(market)
         return p_up, 1.0 - p_up
@@ -310,20 +316,3 @@ class MarketCalculator:
         min_s = Config.MIN_SPREAD_BPS / 10_000
         max_s = Config.MAX_SPREAD_BPS / 10_000
         return max(min_s, min(max_s, spread))
-
-    def taker_fee(self, p: float) -> float:
-        """
-        Dynamic taker fee formula: C × 0.25 × (p × (1-p))²
-        where C is normalised so max fee at p=0.5 is ~0.0156 (1.56%).
-        C = 1.0 gives max = 0.25 × (0.5×0.5)² = 0.25 × 0.0625 = 0.015625.
-        """
-        return 0.25 * (p * (1 - p)) ** 2
-
-    def edge_bps(self, fair: float, quoted: float, p: float) -> float:
-        """
-        Expected edge in basis points for a maker order.
-        edge = (quoted - fair) × 10000  — positive means we're quoting
-        above our fair value (good for a sell, bad for a buy).
-        We only place orders where |edge| > MIN_EDGE_BPS.
-        """
-        return (quoted - fair) * 10_000

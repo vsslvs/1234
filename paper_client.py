@@ -2,13 +2,26 @@
 Paper trading client — drop-in replacement for PolymarketClient.
 
 Simulates order placement, cancellation, and resolution without
-sending any real transactions. Tracks virtual balance and P&L.
+sending any real transactions.  Tracks virtual balance and P&L.
+
+Fill simulation
+---------------
+Orders are NOT filled instantly.  They are placed as "pending" resting
+limit orders.  The MarketMaker's CLOB polling loop calls back to check
+if a pending order would have filled based on real Polymarket ask prices.
+Only filled orders participate in resolution.
+
+Balance accounting:
+  - place: balance -= size  (collateral locked)
+  - cancel: balance += size  (collateral released)
+  - resolve(win):  balance += (payout - size)  i.e. the profit delta
+  - resolve(loss): balance += (-size)           i.e. the loss delta
 """
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from collections import deque
+from typing import Deque, Dict, List, Optional
 
 import aiohttp
 
@@ -21,14 +34,14 @@ log = logging.getLogger(__name__)
 class PaperClient:
     """
     Mimics the PolymarketClient interface but operates entirely in memory.
-    Orders are "filled" immediately at the requested price (optimistic fill).
+    Orders start as pending and are filled only when market conditions confirm.
     """
 
     def __init__(self, initial_balance: float = Config.PAPER_BALANCE_USDC):
         self.balance: float = initial_balance
         self.initial_balance: float = initial_balance
         self._open_orders: Dict[str, MakerOrder] = {}
-        self._filled_orders: List[MakerOrder] = []  # capped at 200
+        self._trade_count: int = 0
         self._total_pnl: float = 0.0
         self._http: Optional[aiohttp.ClientSession] = None
 
@@ -50,7 +63,7 @@ class PaperClient:
             "Paper session ended | balance: %.2f USDC | P&L: %+.2f USDC | trades: %d",
             self.balance,
             self.balance - self.initial_balance,
-            len(self._filled_orders),
+            self._trade_count,
         )
 
     async def check_approvals(self) -> None:
@@ -64,7 +77,13 @@ class PaperClient:
         price: float,
         size_usdc: float,
     ) -> Optional[MakerOrder]:
-        """Simulate placing a maker order."""
+        """
+        Simulate placing a maker order.
+
+        Deducts balance as collateral (released on cancel).
+        The order is PENDING — it does NOT fill instantly.
+        Fills are determined by MarketMaker._check_paper_fills().
+        """
         if size_usdc > self.balance:
             log.warning(
                 "Paper: insufficient balance (%.2f < %.2f) — order rejected",
@@ -83,14 +102,10 @@ class PaperClient:
             placed_at=time.monotonic(),
         )
         self._open_orders[order_id] = order
-        self.balance -= size_usdc
-        self._filled_orders.append(order)
-        # Cap to prevent unbounded growth
-        if len(self._filled_orders) > 200:
-            self._filled_orders = self._filled_orders[-200:]
+        self.balance -= size_usdc  # lock collateral
 
         log.info(
-            "Paper ORDER | %s %s @ %.4f | size=%.2f USDC | balance=%.2f",
+            "Paper ORDER (pending) | %s %s @ %.4f | size=%.2f USDC | balance=%.2f",
             "BUY" if side == SIDE_BUY else "SELL",
             token_id[:8] + "...",
             price,
@@ -100,7 +115,7 @@ class PaperClient:
         return order
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a paper order and refund balance."""
+        """Cancel a paper order and release collateral."""
         order = self._open_orders.pop(order_id, None)
         if order:
             self.balance += order.size_usdc
@@ -170,7 +185,11 @@ class PaperClient:
     def resolve_trade(self, won: bool, size_usdc: float, entry_price: float) -> float:
         """
         Resolve a paper trade outcome and update balance.
-        Returns the P&L amount.
+
+        The stake was already deducted on place and refunded on cancel.
+        This method applies only the P&L delta:
+          win:  balance += (payout - size)  where payout = size/price
+          loss: balance += (-size)
         """
         if won:
             shares = size_usdc / entry_price
@@ -179,8 +198,7 @@ class PaperClient:
         else:
             pnl = -size_usdc
 
-        # Only apply the P&L delta here. The stake itself is refunded
-        # separately when cancel_all_orders runs during window rollover.
         self.balance += pnl
         self._total_pnl += pnl
+        self._trade_count += 1
         return pnl

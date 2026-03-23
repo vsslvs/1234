@@ -3,7 +3,6 @@ Win-rate and P&L statistics tracker for the Polymarket BTC market maker.
 
 Tracks per-window trade outcomes and computes:
   - Observed win rate (overall and rolling)
-  - Theoretical win rate from the calibrated logistic signal model
   - Expected value per trade
   - Session P&L estimate
 
@@ -15,35 +14,18 @@ on Binance and Chainlink are highly correlated on 5-minute scales (typical
 delta < 0.05%), so this approximation introduces negligible error for
 statistics purposes.
 
-Calibration math
-----------------
-The logistic signal p_up = 1 / (1 + exp(-k × ret)) maps the BTC return
-observed during the window to a win probability.  We calibrate k so that
-the logistic p at the entry threshold matches the true statistical
-probability derived from a random-walk model:
+Signal model
+------------
+The bot uses a random-walk CDF signal:
 
-    P(win | ret_at_entry) = Φ( ret_at_entry / σ_remaining )
+    p_up = Phi( ret / sigma_remaining )
 
-where:
-    σ_remaining = σ₅ × √(ENTRY_WINDOW_SEC / MARKET_WINDOW_SEC)
-    σ₅          ≈ 0.22%  (BTC annualised-vol 60% → 5-min window)
-
-At entry (dynamic pricing, example with entry_price = 0.94):
-    ret_min     = ln(0.94 / 0.06) / k
-    True P      = Φ(ret_min / σ_remaining)
-
-For exact calibration at σ₅ = 0.22%:  k_exact   = 4 421
-For safety margin at σ₅ = 0.50%:       k_safe    = 2 000  ← used
-(VOLATILITY_GATE_BPS = 200 ensures we skip windows where σ₅ > 0.70%,
- preserving positive EV across all traded conditions.)
-
-Theoretical win rates with k = 2 000, threshold = 0.94:
-    σ₅ = 0.22%  → P = 99.97%  (typical day)
-    σ₅ = 0.50%  → P = 93.6%   (high-vol day, still > break-even 92%)
-    σ₅ > 0.70%  → not traded  (blocked by volatility gate)
+where sigma_remaining = sigma_5m * sqrt(seconds_to_close / 300).
+This gives time-adjusted probabilities that increase confidence as the
+window approaches close.  See market_calculator.py for details.
 
 Break-even win rate = entry_price  (derivation: p = price).
-With dynamic pricing, entry price varies per trade based on market ask.
+With two-sided quoting, both sides fill => guaranteed profit = 1 - cost.
 """
 import logging
 import math
@@ -63,9 +45,9 @@ class TradeRecord:
     """One resolved trade outcome."""
     window_start: int
     side:         str    # "YES" (Up token) or "NO" (Down token)
-    entry_price:  float  # price we paid, e.g. 0.92
+    entry_price:  float  # price we paid, e.g. 0.47
     size_usdc:    float  # USDC staked
-    p_signal:     float  # logistic signal probability at entry
+    p_signal:     float  # p_up probability at entry
     won:          bool   # True if BTC closed in our predicted direction
     pnl:          float  # approximate realised P&L in USDC
 
@@ -74,13 +56,9 @@ class BotStats:
     """
     Tracks win rate and P&L statistics for a single bot session.
 
-    Call record_trade() on every resolved window where we had an order.
+    Call record_trade() on every resolved window where we had a fill.
     Call log_summary() periodically or on shutdown.
     """
-
-    # Default BTC 5-minute return volatility used for theoretical calculations.
-    # Derived from annualised vol 60%: σ₅ = 60% / sqrt(252 × 24 × 12) ≈ 0.22%.
-    SIGMA_5M_DEFAULT: float = 0.0022
 
     def __init__(self) -> None:
         self._trades: Deque[TradeRecord] = deque(maxlen=1000)
@@ -122,7 +100,7 @@ class BotStats:
             self._losses += 1
         self._total_pnl += pnl
         log.info(
-            "Trade  window=%d  side=%-3s  @%.4f  signal=%.1f%%  →  %-4s  "
+            "Trade  window=%d  side=%-3s  @%.4f  signal=%.1f%%  ->  %-4s  "
             "P&L=%+.2f USDC  (session: %d/%d  rate=%.1f%%)",
             window_start, side, entry_price, p_signal * 100,
             "WIN" if won else "LOSS", pnl,
@@ -165,34 +143,10 @@ class BotStats:
             return None
         return sum(t.entry_price for t in self._trades) / len(self._trades)
 
-    # ------------------------------------------------------------------
-    # Theoretical / analytical statistics
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def theoretical_win_rate(
-        k:                 float,
-        threshold:         float,
-        entry_window_sec:  int,
-        market_window_sec: int,
-        sigma_5m:          float = SIGMA_5M_DEFAULT,
-    ) -> float:
-        """
-        P(BTC closes in our direction | we entered at p ≥ threshold).
-
-        Random-walk model:
-            ret_min    = logit(threshold) / k
-                       = ln(threshold / (1−threshold)) / k
-            σ_remaining = σ₅ × √(entry_window_sec / market_window_sec)
-            P(win)     = Φ(ret_min / σ_remaining)
-
-        Uses math.erf for the standard normal CDF (no scipy required):
-            Φ(z) = 0.5 × (1 + erf(z / √2))
-        """
-        ret_min   = math.log(threshold / (1.0 - threshold)) / k
-        sigma_rem = sigma_5m * math.sqrt(entry_window_sec / market_window_sec)
-        z         = ret_min / sigma_rem
-        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    def break_even_win_rate(entry_price: float) -> float:
+        """Minimum win rate for zero EV: p_break_even = entry_price."""
+        return entry_price
 
     @staticmethod
     def theoretical_ev_per_trade(
@@ -203,74 +157,26 @@ class BotStats:
         """
         Expected P&L per trade in USDC.
 
-            EV = p × (size/price) × (1 − price)  +  (1−p) × (−size)
-               = p × shares × profit_per_share − (1−p) × size
+            EV = p * (size/price) * (1 - price) + (1-p) * (-size)
         """
         shares = size_usdc / entry_price
         return win_rate * shares * (1.0 - entry_price) + (1.0 - win_rate) * (-size_usdc)
-
-    @staticmethod
-    def break_even_win_rate(entry_price: float) -> float:
-        """
-        Minimum win rate for zero EV.
-
-        Derivation:
-            p × (1/price − 1) × size = (1−p) × size
-            p × (1 − price)  = (1−p) × price
-            p = price
-        """
-        return entry_price
-
-    @staticmethod
-    def entry_frequency(
-        k:                 float,
-        threshold:         float,
-        market_window_sec: int,
-        entry_window_sec:  int,
-        sigma_5m:          float = SIGMA_5M_DEFAULT,
-    ) -> float:
-        """
-        Fraction of 5-minute windows expected to trigger at least one side.
-
-        At the entry moment (entry_window_sec before close), the elapsed
-        return follows N(0, σ_elapsed²) where
-            σ_elapsed = σ₅ × √((market_window_sec − entry_window_sec)
-                                / market_window_sec)
-        P(trigger one side) = 2 × P(ret > ret_threshold)
-                            = 2 × (1 − Φ(ret_threshold / σ_elapsed))
-        Capped at 1.0.
-        """
-        elapsed_sec = market_window_sec - entry_window_sec
-        sigma_el    = sigma_5m * math.sqrt(elapsed_sec / market_window_sec)
-        ret_min     = math.log(threshold / (1.0 - threshold)) / k
-        z           = ret_min / sigma_el
-        p_one_side  = 0.5 * (1.0 - math.erf(z / math.sqrt(2.0)))
-        return min(2.0 * p_one_side, 1.0)
 
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
-    def log_summary(
-        self,
-        k:                 float,
-        entry_window_sec:  int,
-        market_window_sec: int,
-        max_entry_price:   float = 0.95,
-        size_usdc:         float = 50.0,
-    ) -> None:
-        """Log a formatted block with observed and theoretical statistics."""
+    def log_summary(self) -> None:
+        """Log a formatted block with observed statistics."""
         uptime_h = (time.time() - self._session_start) / 3600
 
         if self.total_trades == 0:
             log.info(
-                "┌─ Bot Statistics (uptime %.1fh) ──────────────────────────────┐\n"
-                "│  No trades recorded yet.\n"
-                "│  Dynamic pricing: entry at market ask (max %.2f)\n"
-                "│  Break-even win rate = entry price (dynamic)\n"
-                "└──────────────────────────────────────────────────────────────┘",
+                "--- Bot Statistics (uptime %.1fh) ---\n"
+                "  No trades recorded yet.\n"
+                "  Two-sided spread quoting: bid = fair - spread\n"
+                "  Fills: pending until market ask <= our bid",
                 uptime_h,
-                max_entry_price,
             )
             return
 
@@ -279,15 +185,22 @@ class BotStats:
         ev_actual  = self.avg_pnl_per_trade or 0.0
         avg_entry  = self.avg_entry_price or 0.0
 
+        # Count two-sided windows (both YES and NO filled in same window)
+        from collections import Counter
+        window_sides: Counter = Counter()
+        for t in self._trades:
+            window_sides[t.window_start] += 1
+        two_sided = sum(1 for c in window_sides.values() if c >= 2)
+
         log.info(
-            "┌─ Bot Statistics (uptime %.1fh,  %d trades) ───────────────────────┐\n"
-            "│  Wins / Losses          : %d / %d\n"
-            "│  Win rate  (actual)     : %.2f%%\n"
-            "│  Win rate  (roll-%d)    : %.2f%%\n"
-            "│  Avg entry price        : %.4f   Break-even : %.2f%%\n"
-            "│  EV/trade  (actual)     : %+.3f USDC\n"
-            "│  Total P&L              : %+.2f USDC\n"
-            "└────────────────────────────────────────────────────────────────────┘",
+            "--- Bot Statistics (uptime %.1fh, %d trades) ---\n"
+            "  Wins / Losses          : %d / %d\n"
+            "  Win rate  (actual)     : %.1f%%\n"
+            "  Win rate  (roll-%d)    : %.1f%%\n"
+            "  Avg entry price        : %.4f  (break-even: %.1f%%)\n"
+            "  EV/trade  (actual)     : %+.3f USDC\n"
+            "  Total P&L              : %+.2f USDC\n"
+            "  Two-sided fills        : %d windows",
             uptime_h, self.total_trades,
             self._wins, self._losses,
             wr_actual * 100,
@@ -295,4 +208,5 @@ class BotStats:
             avg_entry, avg_entry * 100,
             ev_actual,
             self._total_pnl,
+            two_sided,
         )

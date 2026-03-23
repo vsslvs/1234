@@ -5,10 +5,12 @@ Strategy
 --------
 For each 5-minute BTC window:
 
-1. Compute fair YES / NO prices using Binance mid-price vs window-open price.
+1. Compute fair YES / NO prices via time-adjusted random-walk CDF:
+       p_up = Phi(ret / sigma_remaining)
+   where sigma_remaining shrinks toward zero as the window closes.
 2. Throughout the ENTIRE window (not just last 10 s):
-   - BUY YES at (fair_yes − spread)
-   - BUY NO  at (fair_no  − spread)
+   - BUY YES at (fair_yes - spread)
+   - BUY NO  at (fair_no  - spread)
    Spread narrows as the window progresses (more certainty near close).
 3. Ensure bid_yes + bid_no < 1.0 so that if BOTH sides fill,
    the combined cost < $1 and the bot profits regardless of outcome.
@@ -16,21 +18,17 @@ For each 5-minute BTC window:
    if price has drifted beyond threshold.
 5. EXIT_WINDOW_SEC before close, cancel all orders.
 
-Two-sided quoting
------------------
-- Earns ~3× maker rebates vs one-sided (Polymarket rewards two-sided LPs).
-- If both sides fill: guaranteed profit = $1 − (cost_yes + cost_no).
-- If only one side fills: directional risk, offset by spread over many windows.
+Risk controls
+-------------
+- Volatility gate: skip quoting when 5m candle range > VOLATILITY_GATE_BPS
+- Stale data guard: skip when Binance book age > STALE_DATA_MAX_SEC
+- Circuit breaker: stop quoting if session P&L < -MAX_LOSS_USDC
+- Paper fill simulation: orders only fill when Polymarket ask <= our bid
 
-Dynamic spread
---------------
-Spread = BASE_SPREAD_BPS × (0.5 + time_remaining / window_length).
-Wider early (high uncertainty) → narrower near close (direction clearer).
-Clamped to [MIN_SPREAD_BPS, MAX_SPREAD_BPS].
-
-Cancel/replace < 100 ms
------------------------
-Cancel + new-place fire concurrently via asyncio.gather.
+Orderbook awareness
+-------------------
+A background loop polls Polymarket CLOB best ask/bid every ORDERBOOK_POLL_SEC.
+Used for dashboard display and (in paper mode) realistic fill simulation.
 """
 import asyncio
 import logging
@@ -39,15 +37,17 @@ from typing import Optional
 
 from bot_state import state as dashboard_state, TradeSnapshot
 from config import Config
-from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
+from market_calculator import BtcMarket, MarketCalculator
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
 from stats import BotStats
 from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
 
-# Minimum price change to trigger a cancel/replace (avoids churn)
-PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents
+# Minimum price change to trigger a cancel/replace.
+# 1 cent — reduces churn vs the old 0.5-cent threshold while still
+# tracking fair-price moves that matter for our 1.5-4.5 cent spread.
+PRICE_DRIFT_THRESHOLD = 0.01
 
 
 class MarketSide:
@@ -60,9 +60,10 @@ class MarketSide:
 
         # Stats fields — survive order cancellation so _evaluate_and_record_window
         # can read them at rollover time even after EXIT_WINDOW cancel.
-        self.was_ever_active:    bool  = False
-        self.p_signal_at_entry:  float = 0.0
-        self.last_entry_price:   float = 0.0
+        self.was_ever_active:    bool  = False   # True if an order was placed
+        self.was_ever_filled:    bool  = False   # True if order filled (paper: market crossed)
+        self.p_signal_at_entry:  float = 0.0     # p_up when first order was placed
+        self.last_entry_price:   float = 0.0     # price of most recent order
 
     @property
     def has_order(self) -> bool:
@@ -116,6 +117,17 @@ class MarketMaker:
         self._last_quote_log: float = 0.0
         self._last_volgate_log: float = 0.0
 
+        # CLOB orderbook cache (updated by _clob_poll_loop)
+        self._last_yes_ask: Optional[float] = None
+        self._last_no_ask:  Optional[float] = None
+
+        # Circuit breaker state
+        self._circuit_open = False
+
+    @property
+    def _is_paper(self) -> bool:
+        return hasattr(self._client, 'resolve_trade')
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -128,6 +140,7 @@ class MarketMaker:
         await self._refresh_market_list()
 
         asyncio.create_task(self._market_refresh_loop(), name="market-refresh")
+        asyncio.create_task(self._clob_poll_loop(), name="clob-poll")
 
         interval = Config.QUOTE_REFRESH_MS / 1000
         while self._running:
@@ -154,13 +167,7 @@ class MarketMaker:
 
     async def stop(self) -> None:
         self._running = False
-        self._stats.log_summary(
-            k=K_SIGNAL,
-            entry_window_sec=Config.ENTRY_WINDOW_SEC,
-            market_window_sec=Config.MARKET_WINDOW_SEC,
-            max_entry_price=Config.MAX_ENTRY_PRICE,
-            size_usdc=Config.ORDER_SIZE_USDC,
-        )
+        self._stats.log_summary()
         await self._cancel_all_open()
 
     # ------------------------------------------------------------------
@@ -192,6 +199,10 @@ class MarketMaker:
                 )
             return
 
+        # --- Circuit breaker ---
+        if self._check_circuit_breaker():
+            return
+
         # --- Determine phase ---
         stc = market.seconds_to_close
         if stc <= Config.EXIT_WINDOW_SEC:
@@ -201,13 +212,26 @@ class MarketMaker:
 
         self._update_dashboard(market, state, phase)
 
-        # Exit window: cancel everything and wait for resolution
         if phase == "exit":
             await self._cancel_window(state)
             return
 
-        # Quote both sides throughout the window
         await self._quote_both_sides(state, market)
+
+    def _check_circuit_breaker(self) -> bool:
+        """Stop trading if session P&L drops below -MAX_LOSS_USDC."""
+        if self._stats.total_pnl < -Config.MAX_LOSS_USDC:
+            if not self._circuit_open:
+                self._circuit_open = True
+                log.warning(
+                    "CIRCUIT BREAKER | session P&L=%.2f < -%.2f — quoting stopped",
+                    self._stats.total_pnl, Config.MAX_LOSS_USDC,
+                )
+            return True
+        if self._circuit_open:
+            self._circuit_open = False
+            log.info("Circuit breaker reset | P&L=%.2f", self._stats.total_pnl)
+        return False
 
     def _update_dashboard(self, market: BtcMarket, state: WindowState, phase: str) -> None:
         """Push current state to the shared dashboard object."""
@@ -251,13 +275,11 @@ class MarketMaker:
             self._windows_since_stats_log += 1
             if self._windows_since_stats_log >= Config.STATS_LOG_INTERVAL:
                 self._windows_since_stats_log = 0
-                self._stats.log_summary(
-                    k=K_SIGNAL,
-                    entry_window_sec=Config.ENTRY_WINDOW_SEC,
-                    market_window_sec=Config.MARKET_WINDOW_SEC,
-                    max_entry_price=Config.MAX_ENTRY_PRICE,
-                    size_usdc=Config.ORDER_SIZE_USDC,
-                )
+                self._stats.log_summary()
+
+        # Reset CLOB cache for new window
+        self._last_yes_ask = None
+        self._last_no_ask = None
 
         self._state = WindowState(new_market)
         log.info(
@@ -278,7 +300,7 @@ class MarketMaker:
         bid_no  = fair_no  - spread = (1 - fair_yes) - spread
 
         If both fill, total cost = bid_yes + bid_no < 1.0
-        → guaranteed profit regardless of outcome.
+        -> guaranteed profit regardless of outcome.
         """
         # --- Volatility gate ---
         candle_vol = self._ob_ws.candle.volatility_bps
@@ -319,10 +341,13 @@ class MarketMaker:
             self._last_quote_log = now
             log.info(
                 "Quoting | BTC=%.2f  p_up=%.4f  spread=%.4f  "
-                "yes_bid=%.2f  no_bid=%.2f  sum=%.2f  vol=%.0fbps  stc=%.0fs",
+                "yes_bid=%.2f  no_bid=%.2f  sum=%.2f  "
+                "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs",
                 self._ob_ws.book.mid_price or 0, p_up, spread,
-                yes_bid, no_bid, yes_bid + no_bid, candle_vol,
-                market.seconds_to_close,
+                yes_bid, no_bid, yes_bid + no_bid,
+                f"{self._last_yes_ask:.2f}" if self._last_yes_ask else "?",
+                f"{self._last_no_ask:.2f}" if self._last_no_ask else "?",
+                candle_vol, market.seconds_to_close,
             )
 
         # --- Place/refresh orders on both sides ---
@@ -333,6 +358,8 @@ class MarketMaker:
             if not state.yes.was_ever_active:
                 state.yes.p_signal_at_entry = p_up
                 state.yes.was_ever_active = True
+                if not self._is_paper:
+                    state.yes.was_ever_filled = True  # live: assume fill
             state.yes.last_entry_price = yes_bid
             tasks.append(self._refresh_side(state.yes, yes_bid))
 
@@ -341,11 +368,64 @@ class MarketMaker:
             if not state.no.was_ever_active:
                 state.no.p_signal_at_entry = p_up
                 state.no.was_ever_active = True
+                if not self._is_paper:
+                    state.no.was_ever_filled = True  # live: assume fill
             state.no.last_entry_price = no_bid
             tasks.append(self._refresh_side(state.no, no_bid))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ------------------------------------------------------------------
+    # CLOB orderbook polling (background)
+    # ------------------------------------------------------------------
+
+    async def _clob_poll_loop(self) -> None:
+        """
+        Poll Polymarket CLOB for best bid/ask every ORDERBOOK_POLL_SEC.
+        Updates dashboard and checks paper fills.
+        """
+        while self._running:
+            await asyncio.sleep(Config.ORDERBOOK_POLL_SEC)
+            if not self._running or self._state is None:
+                continue
+            state = self._state
+            try:
+                yes_p, no_p = await asyncio.gather(
+                    self._client.get_best_prices(state.yes.token_id),
+                    self._client.get_best_prices(state.no.token_id),
+                )
+                self._last_yes_ask = yes_p.get("best_ask")
+                self._last_no_ask  = no_p.get("best_ask")
+
+                # Update dashboard
+                dashboard_state.market_yes_ask = self._last_yes_ask
+                dashboard_state.market_no_ask  = self._last_no_ask
+
+                # Paper fill simulation
+                if self._is_paper:
+                    self._check_paper_fills(state)
+
+            except Exception as exc:
+                log.debug("CLOB poll error: %s", exc)
+
+    def _check_paper_fills(self, state: WindowState) -> None:
+        """
+        In paper mode, check if our resting orders would have filled.
+        A BUY order fills if the Polymarket market ask <= our bid price.
+        """
+        for side, ask in [
+            (state.yes, self._last_yes_ask),
+            (state.no,  self._last_no_ask),
+        ]:
+            if side.was_ever_filled or not side.has_order or ask is None:
+                continue
+            if side.order.price >= ask:
+                side.was_ever_filled = True
+                log.info(
+                    "Paper FILL | %s @ %.4f (market ask=%.4f)",
+                    side.side_label, side.order.price, ask,
+                )
 
     # ------------------------------------------------------------------
     # Window evaluation
@@ -355,8 +435,9 @@ class MarketMaker:
         """
         Approximate trade outcome for the closing window and record it.
 
-        Resolution approximation:
-          actual_up = (Binance mid at rollover) >= (window open price)
+        Only resolves sides where was_ever_filled is True:
+        - Live mode: filled = True when order placed (optimistic)
+        - Paper mode: filled = True only when CLOB ask <= our bid
         """
         market = state.market
         mid    = self._ob_ws.book.mid_price
@@ -364,10 +445,10 @@ class MarketMaker:
             return
 
         btc_closed_up = mid >= market.open_price
-        both_active = state.yes.was_ever_active and state.no.was_ever_active
+        both_filled = state.yes.was_ever_filled and state.no.was_ever_filled
 
         for side in (state.yes, state.no):
-            if not side.was_ever_active:
+            if not side.was_ever_filled:
                 continue
             signal_is_up = (side.side_label == "YES")
             won = (btc_closed_up == signal_is_up)
@@ -381,11 +462,9 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
-            # Resolve paper trade balance
             if hasattr(self._client, 'resolve_trade'):
                 self._client.resolve_trade(won, Config.ORDER_SIZE_USDC, entry_price)
 
-            # Push to dashboard
             shares = Config.ORDER_SIZE_USDC / entry_price
             pnl = shares * (1.0 - entry_price) if won else -Config.ORDER_SIZE_USDC
             dashboard_state.recent_trades.append(TradeSnapshot(
@@ -401,17 +480,24 @@ class MarketMaker:
             if len(dashboard_state.recent_trades) > 50:
                 dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
 
-        # Log two-sided summary
-        if both_active:
-            yes_p = state.yes.last_entry_price or 0
-            no_p  = state.no.last_entry_price or 0
-            total_cost = yes_p + no_p
-            margin_cents = (1.0 - total_cost) * 100
-            log.info(
-                "Two-sided | yes@%.2f + no@%.2f = %.2f | margin=%.1f¢/pair | %s",
-                yes_p, no_p, total_cost, margin_cents,
-                "UP" if btc_closed_up else "DOWN",
-            )
+        # Log summary for windows where at least one side was active
+        if state.yes.was_ever_active or state.no.was_ever_active:
+            yes_fill = "FILL" if state.yes.was_ever_filled else "no-fill"
+            no_fill  = "FILL" if state.no.was_ever_filled else "no-fill"
+            if both_filled:
+                yes_p = state.yes.last_entry_price or 0
+                no_p  = state.no.last_entry_price or 0
+                margin_cents = (1.0 - yes_p - no_p) * 100
+                log.info(
+                    "Two-sided | yes@%.2f(%s) + no@%.2f(%s) = %.2f | margin=%.1f¢ | %s",
+                    yes_p, yes_fill, no_p, no_fill, yes_p + no_p,
+                    margin_cents, "UP" if btc_closed_up else "DOWN",
+                )
+            else:
+                log.info(
+                    "One-sided | yes(%s) no(%s) | %s",
+                    yes_fill, no_fill, "UP" if btc_closed_up else "DOWN",
+                )
 
     # ------------------------------------------------------------------
     # Order helpers
@@ -464,7 +550,7 @@ class MarketMaker:
         await self._client.cancel_all_orders()
 
     # ------------------------------------------------------------------
-    # Background market list refresh
+    # Background loops
     # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self) -> None:

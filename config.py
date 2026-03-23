@@ -29,7 +29,6 @@ class Config:
     # Sizing (USDC has 6 decimal places on Polygon)
     ORDER_SIZE_USDC: float = _get("ORDER_SIZE_USDC", "50", float)
     ORDER_SIZE_RAW: int = int(_get("ORDER_SIZE_USDC", "50", float) * 1_000_000)
-    MAX_OPEN_ORDERS: int = _get("MAX_OPEN_ORDERS", "4", int)
 
     # Pricing
     MAX_ENTRY_PRICE: float = _get("MAX_ENTRY_PRICE", "0.95", float)
@@ -41,29 +40,31 @@ class Config:
     MIN_SPREAD_BPS: int = _get("MIN_SPREAD_BPS", "100", int)        # 1¢ floor
     MAX_SPREAD_BPS: int = _get("MAX_SPREAD_BPS", "600", int)        # 6¢ ceiling
 
+    # Signal model: BTC 5-minute return volatility.
+    # 60% annualised → σ₅ = 60% / √(252 × 24 × 12) ≈ 0.22%.
+    SIGMA_5M: float = _get("SIGMA_5M", "0.0022", float)
+
     # Timing (ms)
     QUOTE_REFRESH_MS: int = _get("QUOTE_REFRESH_MS", "200", int)
     CANCEL_REPLACE_TIMEOUT_MS: int = _get("CANCEL_REPLACE_TIMEOUT_MS", "90", int)
-    ENTRY_WINDOW_SEC: int = _get("ENTRY_WINDOW_SEC", "10", int)
+    ENTRY_WINDOW_SEC: int = _get("ENTRY_WINDOW_SEC", "10", int)  # kept for setup.py compat
     EXIT_WINDOW_SEC: int = _get("EXIT_WINDOW_SEC", "2", int)
 
-    # Risk
-    MAX_EXPOSURE_USDC: float = _get("MAX_EXPOSURE_USDC", "500", float)
+    # How often to poll Polymarket CLOB for best bid/ask (seconds).
+    # Used for dashboard display and paper-mode fill simulation.
+    ORDERBOOK_POLL_SEC: float = _get("ORDERBOOK_POLL_SEC", "10", float)
 
-    # Stale data guard: skip trading if the Binance order book hasn't been
-    # updated for more than this many seconds.  Protects against placing
-    # orders based on outdated BTC prices when the WebSocket is disconnected
-    # but the Polymarket API is still reachable.
+    # Risk
+    # Session loss limit: stop quoting if cumulative P&L drops below this.
+    MAX_LOSS_USDC: float = _get("MAX_LOSS_USDC", "200", float)
+
+    # Stale data guard
     STALE_DATA_MAX_SEC: float = _get("STALE_DATA_MAX_SEC", "5", float)
 
-    # Volatility gate: skip trading if the latest 5-minute Binance candle
-    # high-low range exceeds this threshold (basis points, relative to close).
-    # 200 bps = 2% range.  At σ₅ = 0.22% typical, a 2% range represents
-    # ~3× normal volatility and signals flash-crash / news event conditions
-    # where the random-walk model breaks down and EV turns negative.
+    # Volatility gate (bps): skip trading when 5m candle range exceeds this.
     VOLATILITY_GATE_BPS: float = _get("VOLATILITY_GATE_BPS", "200", float)
 
-    # Log a statistics summary every N window rollovers (≈ every N × 5 minutes).
+    # Log a statistics summary every N window rollovers.
     STATS_LOG_INTERVAL: int = _get("STATS_LOG_INTERVAL", "10", int)
 
     # 5-minute BTC markets: 288 per day, each window = 300 seconds
