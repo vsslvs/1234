@@ -44,7 +44,8 @@ class BotState:
     window_start: int = 0
     window_end: int = 0
     seconds_to_close: float = 0.0
-    phase: str = "initializing"  # "waiting", "entry", "exit", "vol_skip"
+    phase: str = "initializing"  # "quoting", "exit", "vol_skip"
+    spread: float = 0.0          # current dynamic spread in price units
 
     # Orders
     yes_order_active: bool = False
@@ -88,6 +89,7 @@ class BotState:
             "window_end": self.window_end,
             "seconds_to_close": round(self.seconds_to_close, 1),
             "phase": self.phase,
+            "spread": round(self.spread, 4),
             "yes_order_active": self.yes_order_active,
             "no_order_active": self.no_order_active,
             "yes_order_price": round(self.yes_order_price, 4),

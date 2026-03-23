@@ -32,12 +32,14 @@ class Config:
     MAX_OPEN_ORDERS: int = _get("MAX_OPEN_ORDERS", "4", int)
 
     # Pricing
-    # Dynamic entry: use market ask, capped at MAX_ENTRY_PRICE.
-    # Old fixed TARGET_PRICE_YES/NO=0.92 replaced with dynamic pricing.
     MAX_ENTRY_PRICE: float = _get("MAX_ENTRY_PRICE", "0.95", float)
-    MIN_EDGE_BPS: int = _get("MIN_EDGE_BPS", "200", int)
-    # p_signal must exceed break-even (= entry_price) by this many bps
-    BREAKEVEN_SAFETY_BPS: int = _get("BREAKEVEN_SAFETY_BPS", "200", int)
+
+    # Two-sided spread parameters (basis points)
+    # We BUY at (fair - spread) on both YES and NO.
+    # Wider early in window → narrower near close.
+    BASE_SPREAD_BPS: int = _get("BASE_SPREAD_BPS", "300", int)      # 3¢ base
+    MIN_SPREAD_BPS: int = _get("MIN_SPREAD_BPS", "100", int)        # 1¢ floor
+    MAX_SPREAD_BPS: int = _get("MAX_SPREAD_BPS", "600", int)        # 6¢ ceiling
 
     # Timing (ms)
     QUOTE_REFRESH_MS: int = _get("QUOTE_REFRESH_MS", "200", int)

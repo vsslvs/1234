@@ -41,25 +41,16 @@ log = logging.getLogger(__name__)
 GAMMA_API = "https://gamma-api.polymarket.com"
 WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 
-# Logistic signal steepness.  Maps BTC return at entry → win probability.
+# Logistic signal steepness.  Maps BTC return → win probability.
 #
-# Calibration (random-walk model):
-#   σ₅    = 0.22%   (BTC 5-min vol: 60% annual → 5-min window)
-#   σ_rem = σ₅ × √(ENTRY_WINDOW_SEC / WINDOW_SEC)
-#         = 0.22% × √(10/300) = 0.040%
+# k=500 gives nuanced probabilities suitable for two-sided market making:
+#   At 0.22% return (1σ): p_up ≈ 0.75  (not saturated)
+#   At 0.50% return:       p_up ≈ 0.92
+#   At 1.0%  return:       p_up ≈ 0.993
 #
-#   For p=0.94 to equal true P at entry:
-#     k_exact  = logit(0.94) / (Φ⁻¹(0.94) × σ_rem) = 2.75 / (1.555×0.040%) ≈ 4 421
-#
-#   k_safe = 2 000 chosen for robustness up to σ₅=0.50% (high-vol day).
-#   VOLATILITY_GATE_BPS=200 blocks windows where σ₅ > 0.70%,
-#   ensuring positive EV (actual P > break-even 0.92) across all traded windows.
-#
-#   Win rates with k=2000, threshold=0.94:
-#     σ₅ = 0.22% → P = 99.97%  (typical day)
-#     σ₅ = 0.50% → P = 93.6%   (high-vol,  EV > 0)
-#     σ₅ > 0.70% → not traded  (VOLATILITY_GATE blocks)
-K_SIGNAL: float = 2000.0
+# This avoids the k=2000 regime where p_up saturates to 0/1 almost
+# immediately, leaving no room for spread-based quoting.
+K_SIGNAL: float = 500.0
 
 
 @dataclass
@@ -301,6 +292,24 @@ class MarketCalculator:
         """
         p_up = self.p_up_signal(market)
         return p_up, 1.0 - p_up
+
+    def dynamic_spread(self, market: BtcMarket) -> float:
+        """
+        Dynamic spread that narrows as the window approaches close.
+
+        Early (300s left): spread = base × 1.5  (high uncertainty)
+        Late  (10s left):  spread = base × 0.53 (direction clearer)
+
+        Returns spread in price units (e.g. 0.03 = 3 cents).
+        """
+        time_frac = market.seconds_to_close / Config.MARKET_WINDOW_SEC  # 1.0→0.0
+        time_scale = 0.5 + time_frac  # 1.5 → 0.5
+        base = Config.BASE_SPREAD_BPS / 10_000
+        spread = base * time_scale
+
+        min_s = Config.MIN_SPREAD_BPS / 10_000
+        max_s = Config.MAX_SPREAD_BPS / 10_000
+        return max(min_s, min(max_s, spread))
 
     def taker_fee(self, p: float) -> float:
         """

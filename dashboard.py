@@ -181,14 +181,14 @@ function fmt(n, d=2) { return n != null ? n.toFixed(d) : '--'; }
 function fmtUsd(n) { return n != null ? '$' + n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) : '--'; }
 
 const phaseColors = {
-  'waiting': 'badge-blue', 'entry': 'badge-yellow',
-  'exit': 'badge-red', 'vol_skip': 'badge-red',
-  'initializing': 'badge-blue'
+  'quoting': 'badge-green', 'waiting': 'badge-blue',
+  'entry': 'badge-yellow', 'exit': 'badge-red',
+  'vol_skip': 'badge-red', 'initializing': 'badge-blue'
 };
 const phaseLabels = {
-  'waiting': 'WAITING', 'entry': 'ENTRY WINDOW',
-  'exit': 'EXIT WINDOW', 'vol_skip': 'VOL SKIP',
-  'initializing': 'INIT'
+  'quoting': 'QUOTING', 'waiting': 'WAITING',
+  'entry': 'ENTRY WINDOW', 'exit': 'EXIT WINDOW',
+  'vol_skip': 'VOL SKIP', 'initializing': 'INIT'
 };
 
 async function refresh() {

@@ -28,7 +28,7 @@ class PaperClient:
         self.balance: float = initial_balance
         self.initial_balance: float = initial_balance
         self._open_orders: Dict[str, MakerOrder] = {}
-        self._filled_orders: List[MakerOrder] = []
+        self._filled_orders: List[MakerOrder] = []  # capped at 200
         self._total_pnl: float = 0.0
         self._http: Optional[aiohttp.ClientSession] = None
 
@@ -85,6 +85,9 @@ class PaperClient:
         self._open_orders[order_id] = order
         self.balance -= size_usdc
         self._filled_orders.append(order)
+        # Cap to prevent unbounded growth
+        if len(self._filled_orders) > 200:
+            self._filled_orders = self._filled_orders[-200:]
 
         log.info(
             "Paper ORDER | %s %s @ %.4f | size=%.2f USDC | balance=%.2f",
