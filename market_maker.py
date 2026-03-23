@@ -8,9 +8,9 @@ For each 5-minute BTC window:
 1. Look up the Polymarket market for the current window.
 2. Compute fair YES / NO prices using Binance mid-price vs window-open price.
 3. During the ENTRY WINDOW (last ENTRY_WINDOW_SEC seconds before close):
-   - Quote YES at market ask (capped at MAX_ENTRY_PRICE) if edge ≥ MIN_EDGE_BPS
-     and p_up > entry_price + BREAKEVEN_SAFETY_BPS
-   - Quote NO  symmetrically if p_down signal is strong enough
+   - Quote YES at market ask (capped at MAX_ENTRY_PRICE) if p_up > 0.5,
+     edge ≥ MIN_EDGE_BPS, and p_up > entry_price + BREAKEVEN_SAFETY_BPS
+   - Quote NO  only if p_up < 0.5 (signal favours DOWN) and same edge checks
    - Dynamic pricing adapts to real orderbook conditions
 4. Every QUOTE_REFRESH_MS ms, check if price has drifted enough to warrant
    a cancel/replace cycle.
@@ -338,7 +338,7 @@ class MarketMaker:
 
         # ----- YES side: buy UP token if edge + break-even check pass -----
         safety = Config.BREAKEVEN_SAFETY_BPS / 10_000
-        if yes_best_ask is not None:
+        if yes_best_ask is not None and p_up > 0.5:
             target = min(yes_best_ask, Config.MAX_ENTRY_PRICE)
             edge = (fair_yes - target) * 10_000
             # Break-even win rate = entry price; require p_up > target + safety
@@ -368,7 +368,7 @@ class MarketMaker:
 
         # ----- NO side: buy DOWN token if edge + break-even check pass -----
         p_down = 1.0 - p_up
-        if no_best_ask is not None:
+        if no_best_ask is not None and p_up < 0.5:
             target = min(no_best_ask, Config.MAX_ENTRY_PRICE)
             edge = (fair_no - target) * 10_000
             breakeven_ok = p_down > target + safety
