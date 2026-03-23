@@ -253,18 +253,18 @@ def run_setup():
         validator=validate_positive_int,
     )
 
-    target_yes = ask(
-        "Целевая цена для стороны YES",
-        hint="От 0.01 до 0.99 (92 центов = 0.92)",
-        default=get_default("TARGET_PRICE_YES", "0.92"),
+    max_entry_price = ask(
+        "Макс. цена входа (динамическое ценообразование)",
+        hint="От 0.50 до 0.99 — бот не купит дороже этой цены",
+        default=get_default("MAX_ENTRY_PRICE", "0.95"),
         validator=validate_price,
     )
 
-    target_no = ask(
-        "Целевая цена для стороны NO",
-        hint="От 0.01 до 0.99 (92 центов = 0.92)",
-        default=get_default("TARGET_PRICE_NO", "0.92"),
-        validator=validate_price,
+    breakeven_safety = ask(
+        "Запас прочности к break-even (bps)",
+        hint="p_signal должен превышать break-even на столько bps",
+        default=get_default("BREAKEVEN_SAFETY_BPS", "200"),
+        validator=validate_positive_int,
     )
 
     # ── 3. Управление рисками ─────────────────────────────────
@@ -398,8 +398,8 @@ BINANCE_WS_URL={binance_ws}
 BTC_SYMBOL=BTCUSDT
 ORDER_SIZE_USDC={order_size}
 MAX_OPEN_ORDERS={max_orders}
-TARGET_PRICE_YES={target_yes}
-TARGET_PRICE_NO={target_no}
+MAX_ENTRY_PRICE={max_entry_price}
+BREAKEVEN_SAFETY_BPS={breakeven_safety}
 
 # Таймеры
 QUOTE_REFRESH_MS={quote_refresh}

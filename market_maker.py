@@ -8,21 +8,23 @@ For each 5-minute BTC window:
 1. Look up the Polymarket market for the current window.
 2. Compute fair YES / NO prices using Binance mid-price vs window-open price.
 3. During the ENTRY WINDOW (last ENTRY_WINDOW_SEC seconds before close):
-   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.80
-   - Quote NO  at TARGET_PRICE_NO   (e.g. 0.92) if P(up) < 0.20
-   - (High-confidence signal only — avoid quoting around 50%)
+   - Quote YES at market ask (capped at MAX_ENTRY_PRICE) if edge ≥ MIN_EDGE_BPS
+     and p_up > entry_price + BREAKEVEN_SAFETY_BPS
+   - Quote NO  symmetrically if p_down signal is strong enough
+   - Dynamic pricing adapts to real orderbook conditions
 4. Every QUOTE_REFRESH_MS ms, check if price has drifted enough to warrant
    a cancel/replace cycle.
 5. 2 seconds before close, cancel all open orders to avoid fills on an
    already-known outcome.
 
-Why only high-confidence entry?
-- Taker fee at p=0.50 is ~1.56%. Even as a maker (0 fee), if you quote
-  at 0.92 on the losing side, you lose $0.92 per share. You need the
-  signal to be right >92% of the time.
-- At ±0.3% BTC move in a 5m window the logistic signal gives ~85%.
-  Combined with the discount rebate, EV is positive.
-- Markets near 50% have the most adverse-selection risk from faster bots.
+Dynamic entry pricing
+---------------------
+Entry price is the real Polymarket ask (capped at MAX_ENTRY_PRICE).
+Two conditions must hold:
+  1. Edge = (fair_price - entry_price) ≥ MIN_EDGE_BPS
+  2. Break-even safety: p_signal > entry_price + BREAKEVEN_SAFETY_BPS/10000
+This replaces the old fixed TARGET_PRICE_YES=0.92 approach, which gave
+unrealistic fills in paper mode and wouldn't fill in live trading.
 
 Rebate mechanic
 ---------------
@@ -52,12 +54,7 @@ from ws_orderbook import OrderBookWS
 log = logging.getLogger(__name__)
 
 # Minimum price change to trigger a cancel/replace (avoids churn)
-PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
-# Probability threshold: only quote if signal is this strong.
-# For positive EV buying YES at TARGET_PRICE_YES=0.92 we need p_up > 0.92.
-# Using 0.94 gives ~200 bps expected edge at entry, providing a safety margin.
-P_UP_THRESHOLD   = 0.94
-P_DOWN_THRESHOLD = 0.06
+PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents
 
 
 class MarketSide:
@@ -170,8 +167,7 @@ class MarketMaker:
             k=K_SIGNAL,
             entry_window_sec=Config.ENTRY_WINDOW_SEC,
             market_window_sec=Config.MARKET_WINDOW_SEC,
-            threshold=P_UP_THRESHOLD,
-            entry_price=Config.TARGET_PRICE_YES,
+            max_entry_price=Config.MAX_ENTRY_PRICE,
             size_usdc=Config.ORDER_SIZE_USDC,
         )
         await self._cancel_all_open()
@@ -283,8 +279,7 @@ class MarketMaker:
                     k=K_SIGNAL,
                     entry_window_sec=Config.ENTRY_WINDOW_SEC,
                     market_window_sec=Config.MARKET_WINDOW_SEC,
-                    threshold=P_UP_THRESHOLD,
-                    entry_price=Config.TARGET_PRICE_YES,
+                    max_entry_price=Config.MAX_ENTRY_PRICE,
                     size_usdc=Config.ORDER_SIZE_USDC,
                 )
 
@@ -341,46 +336,60 @@ class MarketMaker:
                 candle_vol,
             )
 
-        # ----- YES side: buy UP token if strong upside signal -----
-        if p_up > P_UP_THRESHOLD:
-            if yes_best_ask is None:
-                log.debug("YES: no ask available on Polymarket — skipping")
+        # ----- YES side: buy UP token if edge + break-even check pass -----
+        safety = Config.BREAKEVEN_SAFETY_BPS / 10_000
+        if yes_best_ask is not None:
+            target = min(yes_best_ask, Config.MAX_ENTRY_PRICE)
+            edge = (fair_yes - target) * 10_000
+            # Break-even win rate = entry price; require p_up > target + safety
+            breakeven_ok = p_up > target + safety
+            if edge >= Config.MIN_EDGE_BPS and breakeven_ok:
+                if not state.yes.was_ever_active:
+                    state.yes.p_signal_at_entry = p_up
+                    state.yes.last_entry_price  = target
+                    state.yes.was_ever_active   = True
+                tasks.append(self._refresh_side(state.yes, target))
             else:
-                # Use real market ask as entry price (capped at TARGET_PRICE)
-                target = min(yes_best_ask, Config.TARGET_PRICE_YES)
-                edge = (fair_yes - target) * 10_000
-                if edge >= Config.MIN_EDGE_BPS:
-                    if not state.yes.was_ever_active:
-                        state.yes.p_signal_at_entry = p_up
-                        state.yes.last_entry_price  = target
-                        state.yes.was_ever_active   = True
-                    tasks.append(self._refresh_side(state.yes, target))
-                else:
+                if state.yes.has_order:
+                    tasks.append(self._cancel_side(state.yes))
+                if edge < Config.MIN_EDGE_BPS and yes_best_ask is not None:
                     log.debug(
-                        "YES: insufficient edge %.0f bps (ask=%.4f, fair=%.4f)",
-                        edge, target, fair_yes,
+                        "YES: edge=%.0fbps < min=%d | ask=%.4f fair=%.4f",
+                        edge, Config.MIN_EDGE_BPS, target, fair_yes,
+                    )
+                elif not breakeven_ok:
+                    log.debug(
+                        "YES: break-even fail | p_up=%.4f <= target+safety=%.4f",
+                        p_up, target + safety,
                     )
         else:
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
 
-        # ----- NO side: buy DOWN token if strong downside signal -----
-        if p_up < P_DOWN_THRESHOLD:
-            if no_best_ask is None:
-                log.debug("NO: no ask available on Polymarket — skipping")
+        # ----- NO side: buy DOWN token if edge + break-even check pass -----
+        p_down = 1.0 - p_up
+        if no_best_ask is not None:
+            target = min(no_best_ask, Config.MAX_ENTRY_PRICE)
+            edge = (fair_no - target) * 10_000
+            breakeven_ok = p_down > target + safety
+            if edge >= Config.MIN_EDGE_BPS and breakeven_ok:
+                if not state.no.was_ever_active:
+                    state.no.p_signal_at_entry = p_up
+                    state.no.last_entry_price  = target
+                    state.no.was_ever_active   = True
+                tasks.append(self._refresh_side(state.no, target))
             else:
-                target = min(no_best_ask, Config.TARGET_PRICE_NO)
-                edge = (fair_no - target) * 10_000
-                if edge >= Config.MIN_EDGE_BPS:
-                    if not state.no.was_ever_active:
-                        state.no.p_signal_at_entry = p_up
-                        state.no.last_entry_price  = target
-                        state.no.was_ever_active   = True
-                    tasks.append(self._refresh_side(state.no, target))
-                else:
+                if state.no.has_order:
+                    tasks.append(self._cancel_side(state.no))
+                if edge < Config.MIN_EDGE_BPS and no_best_ask is not None:
                     log.debug(
-                        "NO: insufficient edge %.0f bps (ask=%.4f, fair=%.4f)",
-                        edge, target, fair_no,
+                        "NO: edge=%.0fbps < min=%d | ask=%.4f fair=%.4f",
+                        edge, Config.MIN_EDGE_BPS, target, fair_no,
+                    )
+                elif not breakeven_ok:
+                    log.debug(
+                        "NO: break-even fail | p_down=%.4f <= target+safety=%.4f",
+                        p_down, target + safety,
                     )
         else:
             if state.no.has_order:

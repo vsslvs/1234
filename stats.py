@@ -28,7 +28,7 @@ where:
     σ_remaining = σ₅ × √(ENTRY_WINDOW_SEC / MARKET_WINDOW_SEC)
     σ₅          ≈ 0.22%  (BTC annualised-vol 60% → 5-min window)
 
-At entry threshold (P_UP_THRESHOLD = 0.94):
+At entry (dynamic pricing, example with entry_price = 0.94):
     ret_min     = ln(0.94 / 0.06) / k
     True P      = Φ(ret_min / σ_remaining)
 
@@ -42,7 +42,8 @@ Theoretical win rates with k = 2 000, threshold = 0.94:
     σ₅ = 0.50%  → P = 93.6%   (high-vol day, still > break-even 92%)
     σ₅ > 0.70%  → not traded  (blocked by volatility gate)
 
-Break-even win rate = TARGET_PRICE_YES = 0.92  (derivation: p = price).
+Break-even win rate = entry_price  (derivation: p = price).
+With dynamic pricing, entry price varies per trade based on market ask.
 """
 import logging
 import math
@@ -157,6 +158,13 @@ class BotStats:
     def avg_pnl_per_trade(self) -> Optional[float]:
         return self._total_pnl / self.total_trades if self.total_trades else None
 
+    @property
+    def avg_entry_price(self) -> Optional[float]:
+        """Average entry price across all trades."""
+        if not self._trades:
+            return None
+        return sum(t.entry_price for t in self._trades) / len(self._trades)
+
     # ------------------------------------------------------------------
     # Theoretical / analytical statistics
     # ------------------------------------------------------------------
@@ -248,60 +256,43 @@ class BotStats:
         k:                 float,
         entry_window_sec:  int,
         market_window_sec: int,
-        threshold:         float = 0.94,
-        entry_price:       float = 0.92,
+        max_entry_price:   float = 0.95,
         size_usdc:         float = 50.0,
     ) -> None:
         """Log a formatted block with observed and theoretical statistics."""
         uptime_h = (time.time() - self._session_start) / 3600
 
-        wr_theory    = self.theoretical_win_rate(
-            k, threshold, entry_window_sec, market_window_sec
-        )
-        wr_breakeven = self.break_even_win_rate(entry_price)
-        ev_theory    = self.theoretical_ev_per_trade(wr_theory, entry_price, size_usdc)
-        freq         = self.entry_frequency(
-            k, threshold, market_window_sec, entry_window_sec
-        )
-        trades_per_day = round(freq * 288)   # 288 five-minute windows per day
-
         if self.total_trades == 0:
             log.info(
                 "┌─ Bot Statistics (uptime %.1fh) ──────────────────────────────┐\n"
                 "│  No trades recorded yet.\n"
-                "│  Theoretical win rate : %.2f%%   Break-even : %.2f%%\n"
-                "│  EV per trade         : %+.3f USDC on %.0f USDC stake\n"
-                "│  Expected frequency   : %.0f%%/window  ≈ %d trades/day\n"
+                "│  Dynamic pricing: entry at market ask (max %.2f)\n"
+                "│  Break-even win rate = entry price (dynamic)\n"
                 "└──────────────────────────────────────────────────────────────┘",
                 uptime_h,
-                wr_theory * 100, wr_breakeven * 100,
-                ev_theory, size_usdc,
-                freq * 100, trades_per_day,
+                max_entry_price,
             )
             return
 
         wr_actual  = self.win_rate or 0.0
         wr_rolling = self.rolling_win_rate() or 0.0
         ev_actual  = self.avg_pnl_per_trade or 0.0
+        avg_entry  = self.avg_entry_price or 0.0
 
         log.info(
             "┌─ Bot Statistics (uptime %.1fh,  %d trades) ───────────────────────┐\n"
             "│  Wins / Losses          : %d / %d\n"
             "│  Win rate  (actual)     : %.2f%%\n"
             "│  Win rate  (roll-%d)    : %.2f%%\n"
-            "│  Win rate  (theory)     : %.2f%%   Break-even : %.2f%%\n"
-            "│  EV/trade  (theory)     : %+.3f USDC\n"
+            "│  Avg entry price        : %.4f   Break-even : %.2f%%\n"
             "│  EV/trade  (actual)     : %+.3f USDC\n"
             "│  Total P&L              : %+.2f USDC\n"
-            "│  Expected frequency     : %.0f%%/window  ≈ %d trades/day\n"
             "└────────────────────────────────────────────────────────────────────┘",
             uptime_h, self.total_trades,
             self._wins, self._losses,
             wr_actual * 100,
             ROLLING_WINDOW, wr_rolling * 100,
-            wr_theory * 100, wr_breakeven * 100,
-            ev_theory,
+            avg_entry, avg_entry * 100,
             ev_actual,
             self._total_pnl,
-            freq * 100, trades_per_day,
         )
