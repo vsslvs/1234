@@ -245,6 +245,104 @@ sudo systemctl start btc-mm
 sudo journalctl -u btc-mm -f
 ```
 
+### Обновление и перезапуск
+
+#### Ручной запуск (терминал)
+
+```bash
+# 1. Остановить бота (Ctrl+C в терминале где он запущен, или найти процесс)
+pkill -SIGINT -f "python main.py"
+
+# 2. Подождать завершения (бот отменит ордера и выведет статистику)
+#    Обычно 2-3 секунды. Проверить что процесс завершился:
+pgrep -f "python main.py" || echo "Бот остановлен"
+
+# 3. Обновить код
+cd /path/to/bot
+git pull origin main
+
+# 4. Обновить зависимости (если изменился requirements.txt)
+pip install -r requirements.txt
+
+# 5. Проверить .env — новые параметры могут появиться в .env.example
+diff .env .env.example
+
+# 6. Запустить бота
+python main.py
+# или в фоне:
+nohup python main.py >> bot.log 2>&1 &
+```
+
+#### Через systemd (рекомендуется для сервера)
+
+```bash
+# 1. Остановить бота (graceful — SIGINT → отмена ордеров → shutdown)
+sudo systemctl stop btc-mm
+
+# 2. Обновить код и зависимости
+cd /path/to/bot
+git pull origin main
+pip install -r requirements.txt
+
+# 3. Проверить новые параметры в .env.example
+diff .env .env.example
+# Добавить новые переменные в .env при необходимости
+
+# 4. Запустить бота
+sudo systemctl start btc-mm
+
+# 5. Проверить что запустился
+sudo systemctl status btc-mm
+sudo journalctl -u btc-mm -n 20 --no-pager
+```
+
+#### Быстрый перезапуск (без обновления кода)
+
+```bash
+# systemd — одной командой
+sudo systemctl restart btc-mm
+
+# Ручной — отправить SIGINT и перезапустить
+pkill -SIGINT -f "python main.py" && sleep 3 && python main.py
+```
+
+#### Обновление только конфигурации (.env)
+
+Изменения в `.env` требуют перезапуска — бот читает конфигурацию один раз при старте.
+
+```bash
+# 1. Отредактировать .env
+nano .env
+
+# 2. Перезапустить
+sudo systemctl restart btc-mm
+```
+
+#### Новые параметры в этом обновлении
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `STALE_DATA_MAX_SEC` | `5` | Макс. возраст данных Binance (сек). Если orderbook не обновлялся дольше — торговля приостанавливается |
+
+Добавьте в `.env` при необходимости (работает и без явного указания — используется значение по умолчанию):
+
+```env
+STALE_DATA_MAX_SEC=5
+```
+
+#### Чек-лист после обновления
+
+1. В логах появилось `MarketMaker starting` — бот запущен
+2. `BTC mid-price: XXXXX` — Binance WS подключён
+3. `New window: ...` — Polymarket рынки найдены
+4. Нет ошибок `Stale data SKIP` — данные свежие
+5. Дашборд доступен (если настроен)
+
+```bash
+# Быстрая проверка логов после старта
+sudo journalctl -u btc-mm -n 30 --no-pager | grep -E "(starting|mid-price|New window|ERROR)"
+```
+
 ---
 
 ## Параметры конфигурации
@@ -282,6 +380,7 @@ sudo journalctl -u btc-mm -f
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `VOLATILITY_GATE_BPS` | `200` | Блокировать торговлю если диапазон свечи > N bps |
+| `STALE_DATA_MAX_SEC` | `5` | Макс. возраст данных Binance (сек) — защита от торговли на устаревших ценах |
 
 ### Статистика и логи
 
