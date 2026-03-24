@@ -315,6 +315,40 @@ class MarketCalculator:
         return max(min_s, min(max_s, spread))
 
     @staticmethod
+    def kelly_size(
+        p_signal: float,
+        entry_price: float,
+        base_size: float,
+    ) -> float:
+        """
+        Half-Kelly position sizing for binary options.
+
+        For a binary option bought at price p with true probability w:
+            Kelly fraction f* = w - p  (= edge / odds)
+            Half-Kelly = f* / 2   (halved for safety — reduces variance ~75%)
+
+        The result is clamped to [MIN_MULT, MAX_MULT] × base_size.
+        Returns 0 if there is no edge (p_signal <= entry_price).
+        """
+        if Config.KELLY_FRACTION <= 0:
+            return base_size
+
+        edge = p_signal - entry_price
+        if edge <= 0:
+            return 0.0
+
+        # f* = edge / (1 - entry_price)  is the full Kelly for binary payoff
+        kelly_f = edge / (1.0 - entry_price) if entry_price < 1.0 else 0.0
+        half_kelly = kelly_f * 0.5 * Config.KELLY_FRACTION
+
+        # Map half_kelly [0..~0.5] → size multiplier [MIN..MAX]
+        mult = Config.KELLY_MIN_SIZE_MULT + half_kelly * (
+            Config.KELLY_MAX_SIZE_MULT - Config.KELLY_MIN_SIZE_MULT
+        )
+        mult = max(Config.KELLY_MIN_SIZE_MULT, min(Config.KELLY_MAX_SIZE_MULT, mult))
+        return round(base_size * mult, 2)
+
+    @staticmethod
     def orderbook_aware_bid(
         fair: float,
         spread: float,

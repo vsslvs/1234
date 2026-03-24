@@ -44,6 +44,27 @@ class Config:
     # 60% annualised → σ₅ = 60% / √(252 × 24 × 12) ≈ 0.22%.
     SIGMA_5M: float = _get("SIGMA_5M", "0.0022", float)
 
+    # Estimated Polymarket fee in price units.  Used to widen the spread
+    # in live mode so the fee doesn't eat into our edge.  Paper mode
+    # ignores this (fees = 0).  Typical maker fee is ~1-2%.
+    LIVE_FEE_ESTIMATE: float = _get("LIVE_FEE_ESTIMATE", "0.015", float)
+
+    # Time-weighted entry: skip quoting in the first QUIET_PERIOD_SEC of
+    # each window.  Early in the window the signal is ≈ 50/50 and spread
+    # is at its widest → fills are unlikely and carry high adverse selection.
+    QUIET_PERIOD_SEC: int = _get("QUIET_PERIOD_SEC", "60", int)
+
+    # Minimum |p_up - 0.5| before the bot will quote.  Prevents placing
+    # orders when the signal is essentially a coin flip.
+    MIN_SIGNAL_EDGE: float = _get("MIN_SIGNAL_EDGE", "0.03", float)
+
+    # Kelly sizing: half-Kelly fraction applied to ORDER_SIZE_USDC.
+    # 0.0 = disabled (always use ORDER_SIZE_USDC).  1.0 = full half-Kelly.
+    KELLY_FRACTION: float = _get("KELLY_FRACTION", "1.0", float)
+    # Kelly floor/ceiling as multipliers of ORDER_SIZE_USDC.
+    KELLY_MIN_SIZE_MULT: float = _get("KELLY_MIN_SIZE_MULT", "0.3", float)
+    KELLY_MAX_SIZE_MULT: float = _get("KELLY_MAX_SIZE_MULT", "3.0", float)
+
     # Timing (ms)
     QUOTE_REFRESH_MS: int = _get("QUOTE_REFRESH_MS", "200", int)
     CANCEL_REPLACE_TIMEOUT_MS: int = _get("CANCEL_REPLACE_TIMEOUT_MS", "90", int)

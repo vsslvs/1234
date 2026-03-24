@@ -64,6 +64,7 @@ class MarketSide:
         self.was_ever_filled:    bool  = False   # True if order filled (paper: market crossed)
         self.p_signal_at_entry:  float = 0.0     # p_up when first order was placed
         self.last_entry_price:   float = 0.0     # price of most recent order
+        self.last_entry_size:    float = 0.0     # USDC size of most recent order
 
     @property
     def has_order(self) -> bool:
@@ -301,11 +302,13 @@ class MarketMaker:
         Place or refresh maker BUY orders on both YES and NO sides.
 
         Pricing pipeline:
-        1. Compute fair prices from signal model
-        2. Compute dynamic spread (time-based)
-        3. Apply inventory skew if one side already filled
-        4. Adjust bids using real CLOB ask (orderbook-aware pricing)
-        5. Enforce bid_yes + bid_no < 1.0 invariant
+        1. Time-weighted entry: skip if in quiet period or signal too weak
+        2. Compute fair prices from signal model
+        3. Compute dynamic spread (time-based) + fee adjustment for live mode
+        4. Apply inventory skew if one side already filled
+        5. Adjust bids using real CLOB ask (orderbook-aware pricing)
+        6. Compute Kelly-optimal order sizes
+        7. Enforce bid_yes + bid_no < 1.0 invariant
 
         If both fill, total cost < $1 → guaranteed profit.
         """
@@ -322,10 +325,30 @@ class MarketMaker:
             await self._cancel_window(state)
             return
 
+        stc = market.seconds_to_close
+        elapsed = Config.MARKET_WINDOW_SEC - stc
+
+        # --- Time-weighted entry: skip quiet period early in window ---
+        if elapsed < Config.QUIET_PERIOD_SEC:
+            return
+
         # --- Fair prices and base spread ---
         fair_yes, fair_no = self._calc.fair_prices(market)
         p_up = fair_yes
+
+        # --- Minimum signal edge filter ---
+        if abs(p_up - 0.5) < Config.MIN_SIGNAL_EDGE:
+            # Signal too close to 50/50 — cancel existing orders, don't quote
+            if state.yes.has_order or state.no.has_order:
+                await self._cancel_window(state)
+            return
+
         base_spread = self._calc.dynamic_spread(market)
+
+        # --- Fee-aware spread: widen in live mode to cover CLOB fees ---
+        if not self._is_paper:
+            base_spread += Config.LIVE_FEE_ESTIMATE
+
         min_spread_price = Config.MIN_SPREAD_BPS / 10_000
 
         # --- Inventory skew: tighten spread on unfilled hedge side ---
@@ -359,6 +382,10 @@ class MarketMaker:
             yes_bid = round(yes_bid * scale, 2)
             no_bid  = round(no_bid  * scale, 2)
 
+        # --- Kelly sizing ---
+        yes_size = self._calc.kelly_size(p_up, yes_bid, Config.ORDER_SIZE_USDC)
+        no_size  = self._calc.kelly_size(1.0 - p_up, no_bid, Config.ORDER_SIZE_USDC)
+
         # --- Periodic log ---
         now = time.monotonic()
         if now - self._last_quote_log >= 5.0:
@@ -371,37 +398,39 @@ class MarketMaker:
                 skew_label = " [skew→YES]"
             log.info(
                 "Quoting | BTC=%.2f  p_up=%.4f  σ=%.4f  spread=%.4f  "
-                "yes_bid=%.2f  no_bid=%.2f  sum=%.2f  "
+                "yes=%.2f($%.0f)  no=%.2f($%.0f)  sum=%.2f  "
                 "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs%s",
                 self._ob_ws.book.mid_price or 0, p_up, sigma, base_spread,
-                yes_bid, no_bid, yes_bid + no_bid,
+                yes_bid, yes_size, no_bid, no_size, yes_bid + no_bid,
                 f"{self._last_yes_ask:.2f}" if self._last_yes_ask else "?",
                 f"{self._last_no_ask:.2f}" if self._last_no_ask else "?",
-                candle_vol, market.seconds_to_close, skew_label,
+                candle_vol, stc, skew_label,
             )
 
         # --- Place/refresh orders on both sides ---
         tasks = []
 
         # YES side
-        if yes_bid >= 0.01:
+        if yes_bid >= 0.01 and yes_size > 0:
             if not state.yes.was_ever_active:
                 state.yes.p_signal_at_entry = p_up
                 state.yes.was_ever_active = True
                 if not self._is_paper:
                     state.yes.was_ever_filled = True  # live: assume fill
             state.yes.last_entry_price = yes_bid
-            tasks.append(self._refresh_side(state.yes, yes_bid))
+            state.yes.last_entry_size = yes_size
+            tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
 
         # NO side
-        if no_bid >= 0.01:
+        if no_bid >= 0.01 and no_size > 0:
             if not state.no.was_ever_active:
                 state.no.p_signal_at_entry = p_up
                 state.no.was_ever_active = True
                 if not self._is_paper:
                     state.no.was_ever_filled = True  # live: assume fill
             state.no.last_entry_price = no_bid
-            tasks.append(self._refresh_side(state.no, no_bid))
+            state.no.last_entry_size = no_size
+            tasks.append(self._refresh_side(state.no, no_bid, no_size))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -483,26 +512,27 @@ class MarketMaker:
             signal_is_up = (side.side_label == "YES")
             won = (btc_closed_up == signal_is_up)
             entry_price = side.last_entry_price if side.last_entry_price > 0 else 0.01
+            size_usdc = side.last_entry_size if side.last_entry_size > 0 else Config.ORDER_SIZE_USDC
 
             self._stats.record_trade(
                 window_start=market.window_start,
                 side=side.side_label,
                 entry_price=entry_price,
-                size_usdc=Config.ORDER_SIZE_USDC,
+                size_usdc=size_usdc,
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
             if hasattr(self._client, 'resolve_trade'):
-                self._client.resolve_trade(won, Config.ORDER_SIZE_USDC, entry_price)
+                self._client.resolve_trade(won, size_usdc, entry_price)
 
-            shares = Config.ORDER_SIZE_USDC / entry_price
-            pnl = shares * (1.0 - entry_price) if won else -Config.ORDER_SIZE_USDC
+            shares = size_usdc / entry_price
+            pnl = shares * (1.0 - entry_price) if won else -size_usdc
             dashboard_state.recent_trades.append(TradeSnapshot(
                 timestamp=time.time(),
                 window_start=market.window_start,
                 side=side.side_label,
                 entry_price=entry_price,
-                size_usdc=Config.ORDER_SIZE_USDC,
+                size_usdc=size_usdc,
                 p_signal=side.p_signal_at_entry,
                 won=won,
                 pnl=pnl,
@@ -533,15 +563,18 @@ class MarketMaker:
     # Order helpers
     # ------------------------------------------------------------------
 
-    async def _refresh_side(self, side: MarketSide, target_price: float) -> None:
+    async def _refresh_side(
+        self, side: MarketSide, target_price: float, size_usdc: float = 0.0,
+    ) -> None:
         """Place a new order or cancel/replace if price drifted."""
+        size = size_usdc or Config.ORDER_SIZE_USDC
         if not side.has_order:
             try:
                 order = await self._client.place_maker_order(
                     token_id=side.token_id,
                     side=SIDE_BUY,
                     price=target_price,
-                    size_usdc=Config.ORDER_SIZE_USDC,
+                    size_usdc=size,
                 )
                 side.order = order
             except Exception as exc:
