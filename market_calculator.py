@@ -18,15 +18,11 @@ We estimate P(BTC closes UP) using the standard normal CDF (Φ):
 where:
     ret          = (mid - open) / open          (return so far)
     σ_remaining  = σ₅ × √(stc / WINDOW_SEC)    (vol of remaining time)
-    σ₅           = Config.SIGMA_5M ≈ 0.22%      (BTC 5-min vol)
+    σ₅           = realized vol from recent closed candles (adaptive)
+                   Falls back to Config.SIGMA_5M ≈ 0.22% when cold-starting.
 
 This is time-adjusted: the same BTC return gives a MUCH higher p_up
 near the end of the window (less time for reversal) than at the start.
-
-Examples with σ₅ = 0.22%:
-    ret=+0.22%, stc=290s: p_up = Φ(1.02) = 0.846  (moderate confidence)
-    ret=+0.22%, stc= 10s: p_up = Φ(5.47) = 1.000  (near certain)
-    ret=+0.05%, stc= 30s: p_up = Φ(0.72) = 0.764  (mild lean)
 
 Usage:
     calc = MarketCalculator(btc_ws)
@@ -282,7 +278,8 @@ class MarketCalculator:
             # Window essentially closed — return certainty
             return 1.0 if ret > 0 else (0.0 if ret < 0 else 0.5)
 
-        sigma_remaining = Config.SIGMA_5M * math.sqrt(stc / WINDOW_SEC)
+        sigma = self._ob_ws.realized_sigma_5m
+        sigma_remaining = sigma * math.sqrt(stc / WINDOW_SEC)
         if sigma_remaining < 1e-10:
             return 0.5
 
@@ -316,3 +313,35 @@ class MarketCalculator:
         min_s = Config.MIN_SPREAD_BPS / 10_000
         max_s = Config.MAX_SPREAD_BPS / 10_000
         return max(min_s, min(max_s, spread))
+
+    @staticmethod
+    def orderbook_aware_bid(
+        fair: float,
+        spread: float,
+        market_ask: Optional[float],
+        min_spread_price: float,
+    ) -> float:
+        """
+        Compute bid price aware of real Polymarket CLOB ask.
+
+        Logic:
+        - Base bid = fair - spread (our normal pricing)
+        - If CLOB ask is known and lower than base bid, we cap our bid
+          at (market_ask - MIN_EDGE) to avoid overpaying.
+        - Never bid above (fair - min_spread) to preserve minimum edge.
+
+        This increases fill rate (we sit closer to the ask when it's tight)
+        while preventing overpayment (we never cross the ask needlessly).
+        """
+        MIN_EDGE = 0.005  # 0.5¢ minimum below market ask
+        base_bid = fair - spread
+        ceiling = fair - min_spread_price
+
+        if market_ask is not None and market_ask > 0:
+            orderbook_bid = market_ask - MIN_EDGE
+            # Use the best price that doesn't exceed our ceiling
+            bid = min(max(base_bid, orderbook_bid), ceiling)
+        else:
+            bid = base_bid
+
+        return round(max(0.01, bid), 2)

@@ -4,13 +4,20 @@ Binance WebSocket order book client.
 Subscribes to <symbol>@depth20@100ms for a full 20-level depth snapshot
 refreshed every 100 ms, and <symbol>@kline_5m for 5-minute candle data
 used in volatility estimation.
+
+Adaptive volatility
+-------------------
+Tracks returns of the last N closed 5-minute candles to compute realized σ.
+This replaces the static Config.SIGMA_5M when enough data is available.
 """
 import asyncio
 import json
 import logging
+import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -80,12 +87,17 @@ class OrderBookWS:
         # then read ob.book and ob.candle freely
     """
 
+    # Minimum closed candles needed before we trust realized vol
+    _MIN_CANDLES_FOR_SIGMA = 6
+
     def __init__(self):
         self.book = OrderBook()
         self.candle = Candle5m()
         self._running = False
         self._reconnect_delay = 1.0  # seconds, doubles on each failure
         self._last_disconnect: float = 0.0  # monotonic time of last disconnect
+        # Realized vol: returns of last 48 closed 5m candles (~4 hours)
+        self._closed_returns: Deque[float] = deque(maxlen=48)
 
     def _stream_url(self) -> str:
         symbol = Config.BTC_SYMBOL.lower()
@@ -145,14 +157,36 @@ class OrderBookWS:
 
     def _update_candle(self, data: dict) -> None:
         k = data.get("k", {})
+        is_closed = bool(k.get("x", False))
+        o = float(k.get("o", 0))
+        c = float(k.get("c", 0))
+
         self.candle = Candle5m(
-            open=float(k.get("o", 0)),
+            open=o,
             high=float(k.get("h", 0)),
             low=float(k.get("l", 0)),
-            close=float(k.get("c", 0)),
+            close=c,
             volume=float(k.get("v", 0)),
-            is_closed=bool(k.get("x", False)),
+            is_closed=is_closed,
         )
+
+        if is_closed and o > 0:
+            self._closed_returns.append((c - o) / o)
+
+    @property
+    def realized_sigma_5m(self) -> float:
+        """
+        Realized 5-minute return volatility from recent closed candles.
+
+        Falls back to Config.SIGMA_5M when not enough data yet.
+        Clamped to [0.0005, 0.006] to prevent extremes.
+        """
+        if len(self._closed_returns) < self._MIN_CANDLES_FOR_SIGMA:
+            return Config.SIGMA_5M
+        returns = list(self._closed_returns)
+        mean = sum(returns) / len(returns)
+        var = sum((r - mean) ** 2 for r in returns) / len(returns)
+        return max(0.0005, min(0.006, math.sqrt(var)))
 
     def stop(self) -> None:
         self._running = False

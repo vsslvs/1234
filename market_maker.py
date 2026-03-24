@@ -251,6 +251,7 @@ class MarketMaker:
         ds.seconds_to_close = market.seconds_to_close
         ds.phase = phase
         ds.spread = spread
+        ds.realized_sigma = self._ob_ws.realized_sigma_5m
         ds.yes_order_active = state.yes.has_order
         ds.no_order_active = state.no.has_order
         ds.yes_order_price = state.yes.order.price if state.yes.order else 0.0
@@ -292,15 +293,21 @@ class MarketMaker:
     # Two-sided quoting (core strategy)
     # ------------------------------------------------------------------
 
+    # Inventory skew: reduce spread on unfilled side to attract fills
+    _INVENTORY_SKEW = 0.4  # 40% spread reduction on the unfilled hedge side
+
     async def _quote_both_sides(self, state: WindowState, market: BtcMarket) -> None:
         """
         Place or refresh maker BUY orders on both YES and NO sides.
 
-        bid_yes = fair_yes - spread
-        bid_no  = fair_no  - spread = (1 - fair_yes) - spread
+        Pricing pipeline:
+        1. Compute fair prices from signal model
+        2. Compute dynamic spread (time-based)
+        3. Apply inventory skew if one side already filled
+        4. Adjust bids using real CLOB ask (orderbook-aware pricing)
+        5. Enforce bid_yes + bid_no < 1.0 invariant
 
-        If both fill, total cost = bid_yes + bid_no < 1.0
-        -> guaranteed profit regardless of outcome.
+        If both fill, total cost < $1 → guaranteed profit.
         """
         # --- Volatility gate ---
         candle_vol = self._ob_ws.candle.volatility_bps
@@ -315,14 +322,31 @@ class MarketMaker:
             await self._cancel_window(state)
             return
 
-        # --- Fair prices and spread ---
+        # --- Fair prices and base spread ---
         fair_yes, fair_no = self._calc.fair_prices(market)
         p_up = fair_yes
-        spread = self._calc.dynamic_spread(market)
+        base_spread = self._calc.dynamic_spread(market)
+        min_spread_price = Config.MIN_SPREAD_BPS / 10_000
 
-        # Bid prices: we BUY at fair - spread
-        yes_bid = round(max(0.01, fair_yes - spread), 2)
-        no_bid  = round(max(0.01, fair_no  - spread), 2)
+        # --- Inventory skew: tighten spread on unfilled hedge side ---
+        yes_spread = base_spread
+        no_spread = base_spread
+        if state.yes.was_ever_filled and not state.no.was_ever_filled:
+            no_spread *= (1.0 - self._INVENTORY_SKEW)
+        elif state.no.was_ever_filled and not state.yes.was_ever_filled:
+            yes_spread *= (1.0 - self._INVENTORY_SKEW)
+
+        # --- Orderbook-aware bids ---
+        yes_bid = self._calc.orderbook_aware_bid(
+            fair=fair_yes, spread=yes_spread,
+            market_ask=self._last_yes_ask,
+            min_spread_price=min_spread_price,
+        )
+        no_bid = self._calc.orderbook_aware_bid(
+            fair=fair_no, spread=no_spread,
+            market_ask=self._last_no_ask,
+            min_spread_price=min_spread_price,
+        )
 
         # Cap at MAX_ENTRY_PRICE
         yes_bid = min(yes_bid, Config.MAX_ENTRY_PRICE)
@@ -339,15 +363,21 @@ class MarketMaker:
         now = time.monotonic()
         if now - self._last_quote_log >= 5.0:
             self._last_quote_log = now
+            sigma = self._ob_ws.realized_sigma_5m
+            skew_label = ""
+            if state.yes.was_ever_filled and not state.no.was_ever_filled:
+                skew_label = " [skew→NO]"
+            elif state.no.was_ever_filled and not state.yes.was_ever_filled:
+                skew_label = " [skew→YES]"
             log.info(
-                "Quoting | BTC=%.2f  p_up=%.4f  spread=%.4f  "
+                "Quoting | BTC=%.2f  p_up=%.4f  σ=%.4f  spread=%.4f  "
                 "yes_bid=%.2f  no_bid=%.2f  sum=%.2f  "
-                "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs",
-                self._ob_ws.book.mid_price or 0, p_up, spread,
+                "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs%s",
+                self._ob_ws.book.mid_price or 0, p_up, sigma, base_spread,
                 yes_bid, no_bid, yes_bid + no_bid,
                 f"{self._last_yes_ask:.2f}" if self._last_yes_ask else "?",
                 f"{self._last_no_ask:.2f}" if self._last_no_ask else "?",
-                candle_vol, market.seconds_to_close,
+                candle_vol, market.seconds_to_close, skew_label,
             )
 
         # --- Place/refresh orders on both sides ---

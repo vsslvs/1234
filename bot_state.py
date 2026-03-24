@@ -46,6 +46,7 @@ class BotState:
     seconds_to_close: float = 0.0
     phase: str = "initializing"  # "quoting", "exit", "vol_skip"
     spread: float = 0.0          # current dynamic spread in price units
+    realized_sigma: float = 0.0  # adaptive 5m vol from closed candles
 
     # Orders
     yes_order_active: bool = False
@@ -90,6 +91,7 @@ class BotState:
             "seconds_to_close": round(self.seconds_to_close, 1),
             "phase": self.phase,
             "spread": round(self.spread, 4),
+            "realized_sigma": round(self.realized_sigma, 6),
             "yes_order_active": self.yes_order_active,
             "no_order_active": self.no_order_active,
             "yes_order_price": round(self.yes_order_price, 4),
