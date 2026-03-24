@@ -286,7 +286,22 @@ class MarketCalculator:
         z = ret / sigma_remaining
         # Clamp z to avoid extreme probabilities that cause numerical issues
         z = max(-6.0, min(6.0, z))
-        return _phi(z)
+        p = _phi(z)
+
+        # --- Multi-timeframe trend bias (Phase 3) ---
+        # Blend hourly trend into the 5m signal.  The bias shifts p_up
+        # toward the hourly direction, helping the bot align with the
+        # dominant trend and reducing adverse selection.
+        w = Config.TREND_BIAS_WEIGHT
+        if w > 0:
+            bias = self._ob_ws.hourly_trend_bias  # [-1, +1]
+            # Map bias to a probability shift: +1 → push p toward 1.0
+            # Using a simple linear blend: p' = p * (1-w) + target * w
+            # where target = 0.5 + 0.5*bias (maps [-1,+1] → [0,1])
+            trend_target = 0.5 + 0.5 * bias
+            p = p * (1.0 - w) + trend_target * w
+
+        return max(0.01, min(0.99, p))
 
     def fair_prices(self, market: BtcMarket) -> tuple[float, float]:
         """

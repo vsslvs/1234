@@ -88,6 +88,21 @@ class Config:
     # Log a statistics summary every N window rollovers.
     STATS_LOG_INTERVAL: int = _get("STATS_LOG_INTERVAL", "10", int)
 
+    # --- Phase 3: Multi-timeframe trend filter ---
+    # Weight of 1h trend bias blended into p_up signal.
+    # 0.0 = disabled, 0.15 = default (15% hourly influence).
+    TREND_BIAS_WEIGHT: float = _get("TREND_BIAS_WEIGHT", "0.15", float)
+    # Hourly return that maps to trend_bias = ±1.0.
+    # 0.01 = 1% move saturates bias.
+    TREND_SENSITIVITY: float = _get("TREND_SENSITIVITY", "0.01", float)
+
+    # --- Phase 3: Hedge timeout ---
+    # Seconds after first fill to wait for the hedge side to fill.
+    # If hedge doesn't fill within this window, aggressively tighten spread.
+    HEDGE_TIMEOUT_SEC: float = _get("HEDGE_TIMEOUT_SEC", "60", float)
+    # Spread multiplier for the aggressive hedge tightening phase (0.3 = 30% of normal spread).
+    HEDGE_AGGRESSIVE_SPREAD_MULT: float = _get("HEDGE_AGGRESSIVE_SPREAD_MULT", "0.3", float)
+
     # 5-minute BTC markets: 288 per day, each window = 300 seconds
     MARKET_WINDOW_SEC: int = 300
     MARKETS_PER_DAY: int = 288

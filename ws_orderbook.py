@@ -1,14 +1,21 @@
 """
 Binance WebSocket order book client.
 
-Subscribes to <symbol>@depth20@100ms for a full 20-level depth snapshot
-refreshed every 100 ms, and <symbol>@kline_5m for 5-minute candle data
-used in volatility estimation.
+Subscribes to three combined streams:
+  - <symbol>@depth20@100ms   →  live 20-level order book (refreshed every 100 ms)
+  - <symbol>@kline_5m        →  5-minute candles for volatility + window open price
+  - <symbol>@kline_1h        →  1-hour candles for higher-timeframe trend bias
 
 Adaptive volatility
 -------------------
 Tracks returns of the last N closed 5-minute candles to compute realized σ.
 This replaces the static Config.SIGMA_5M when enough data is available.
+
+Multi-timeframe trend
+---------------------
+The hourly candle return (close - open) / open provides a trend bias that the
+signal model can blend with the 5-minute signal to reduce adverse selection
+during strong trends.
 """
 import asyncio
 import json
@@ -75,16 +82,34 @@ class Candle5m:
         return (self.high - self.low) / self.close * 10_000
 
 
+@dataclass
+class Candle1h:
+    """Current 1-hour candle (may still be open)."""
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    is_closed: bool = False
+
+    @property
+    def ret(self) -> float:
+        """Hourly return: (close - open) / open.  Positive = uptrend."""
+        if self.open <= 0:
+            return 0.0
+        return (self.close - self.open) / self.open
+
+
 class OrderBookWS:
     """
-    Manages two Binance WebSocket streams:
+    Manages three Binance WebSocket streams:
       - <symbol>@depth20@100ms  →  live order book
       - <symbol>@kline_5m       →  5m candles for volatility
+      - <symbol>@kline_1h       →  1h candles for trend bias
 
     Usage:
         ob = OrderBookWS()
         asyncio.create_task(ob.run())
-        # then read ob.book and ob.candle freely
+        # then read ob.book, ob.candle, ob.candle_1h freely
     """
 
     # Minimum closed candles needed before we trust realized vol
@@ -93,6 +118,7 @@ class OrderBookWS:
     def __init__(self):
         self.book = OrderBook()
         self.candle = Candle5m()
+        self.candle_1h = Candle1h()
         self._running = False
         self._reconnect_delay = 1.0  # seconds, doubles on each failure
         self._last_disconnect: float = 0.0  # monotonic time of last disconnect
@@ -101,7 +127,7 @@ class OrderBookWS:
 
     def _stream_url(self) -> str:
         symbol = Config.BTC_SYMBOL.lower()
-        streams = f"{symbol}@depth20@100ms/{symbol}@kline_5m"
+        streams = f"{symbol}@depth20@100ms/{symbol}@kline_5m/{symbol}@kline_1h"
         # Combined streams require /stream?streams= endpoint (not /ws/<path>).
         # Single-stream /ws/ endpoint does not wrap messages in
         # {"stream": ..., "data": ...}, so _handle() would never match depth/kline.
@@ -147,6 +173,8 @@ class OrderBookWS:
 
         if "depth" in stream:
             self._update_book(data)
+        elif "kline_1h" in stream:
+            self._update_candle_1h(data)
         elif "kline" in stream:
             self._update_candle(data)
 
@@ -172,6 +200,32 @@ class OrderBookWS:
 
         if is_closed and o > 0:
             self._closed_returns.append((c - o) / o)
+
+    def _update_candle_1h(self, data: dict) -> None:
+        k = data.get("k", {})
+        self.candle_1h = Candle1h(
+            open=float(k.get("o", 0)),
+            high=float(k.get("h", 0)),
+            low=float(k.get("l", 0)),
+            close=float(k.get("c", 0)),
+            is_closed=bool(k.get("x", False)),
+        )
+
+    @property
+    def hourly_trend_bias(self) -> float:
+        """
+        Trend bias from 1h candle return, clamped to [-1, +1].
+
+        Positive = bullish (favour YES), negative = bearish (favour NO).
+        Maps hourly return through a sensitivity scaler so that a 0.3% move
+        gives ≈0.3 bias and a 1%+ move saturates at ±1.
+        """
+        ret = self.candle_1h.ret
+        if abs(ret) < 1e-8:
+            return 0.0
+        # Scale: 1% hourly move → bias of 1.0
+        bias = ret / Config.TREND_SENSITIVITY
+        return max(-1.0, min(1.0, bias))
 
     @property
     def realized_sigma_5m(self) -> float:

@@ -62,6 +62,7 @@ class MarketSide:
         # can read them at rollover time even after EXIT_WINDOW cancel.
         self.was_ever_active:    bool  = False   # True if an order was placed
         self.was_ever_filled:    bool  = False   # True if order filled (paper: market crossed)
+        self.first_fill_time:    float = 0.0     # monotonic time of first fill (for hedge timeout)
         self.p_signal_at_entry:  float = 0.0     # p_up when first order was placed
         self.last_entry_price:   float = 0.0     # price of most recent order
         self.last_entry_size:    float = 0.0     # USDC size of most recent order
@@ -253,6 +254,19 @@ class MarketMaker:
         ds.phase = phase
         ds.spread = spread
         ds.realized_sigma = self._ob_ws.realized_sigma_5m
+        ds.hourly_trend_bias = self._ob_ws.hourly_trend_bias
+
+        # Hedge timeout status
+        hedge_active = False
+        now_mono = time.monotonic()
+        if state.yes.was_ever_filled and not state.no.was_ever_filled:
+            if state.yes.first_fill_time > 0 and (now_mono - state.yes.first_fill_time) > Config.HEDGE_TIMEOUT_SEC:
+                hedge_active = True
+        elif state.no.was_ever_filled and not state.yes.was_ever_filled:
+            if state.no.first_fill_time > 0 and (now_mono - state.no.first_fill_time) > Config.HEDGE_TIMEOUT_SEC:
+                hedge_active = True
+        ds.hedge_timeout_active = hedge_active
+
         ds.yes_order_active = state.yes.has_order
         ds.no_order_active = state.no.has_order
         ds.yes_order_price = state.yes.order.price if state.yes.order else 0.0
@@ -351,13 +365,26 @@ class MarketMaker:
 
         min_spread_price = Config.MIN_SPREAD_BPS / 10_000
 
-        # --- Inventory skew: tighten spread on unfilled hedge side ---
+        # --- Inventory skew + hedge timeout ---
+        # Normal skew: reduce spread on unfilled hedge side to attract fills.
+        # Hedge timeout: if one side filled but hedge hasn't filled within
+        # HEDGE_TIMEOUT_SEC, aggressively tighten the hedge side spread.
         yes_spread = base_spread
         no_spread = base_spread
+        now_mono = time.monotonic()
+
         if state.yes.was_ever_filled and not state.no.was_ever_filled:
-            no_spread *= (1.0 - self._INVENTORY_SKEW)
+            elapsed_since_fill = now_mono - state.yes.first_fill_time if state.yes.first_fill_time > 0 else 0.0
+            if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
+                no_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
+            else:
+                no_spread *= (1.0 - self._INVENTORY_SKEW)
         elif state.no.was_ever_filled and not state.yes.was_ever_filled:
-            yes_spread *= (1.0 - self._INVENTORY_SKEW)
+            elapsed_since_fill = now_mono - state.no.first_fill_time if state.no.first_fill_time > 0 else 0.0
+            if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
+                yes_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
+            else:
+                yes_spread *= (1.0 - self._INVENTORY_SKEW)
 
         # --- Orderbook-aware bids ---
         yes_bid = self._calc.orderbook_aware_bid(
@@ -393,9 +420,17 @@ class MarketMaker:
             sigma = self._ob_ws.realized_sigma_5m
             skew_label = ""
             if state.yes.was_ever_filled and not state.no.was_ever_filled:
-                skew_label = " [skew→NO]"
+                elapsed_f = now - state.yes.first_fill_time if state.yes.first_fill_time > 0 else 0.0
+                if elapsed_f > Config.HEDGE_TIMEOUT_SEC:
+                    skew_label = " [HEDGE-RUSH→NO %.0fs]" % elapsed_f
+                else:
+                    skew_label = " [skew→NO]"
             elif state.no.was_ever_filled and not state.yes.was_ever_filled:
-                skew_label = " [skew→YES]"
+                elapsed_f = now - state.no.first_fill_time if state.no.first_fill_time > 0 else 0.0
+                if elapsed_f > Config.HEDGE_TIMEOUT_SEC:
+                    skew_label = " [HEDGE-RUSH→YES %.0fs]" % elapsed_f
+                else:
+                    skew_label = " [skew→YES]"
             log.info(
                 "Quoting | BTC=%.2f  p_up=%.4f  σ=%.4f  spread=%.4f  "
                 "yes=%.2f($%.0f)  no=%.2f($%.0f)  sum=%.2f  "
@@ -416,7 +451,8 @@ class MarketMaker:
                 state.yes.p_signal_at_entry = p_up
                 state.yes.was_ever_active = True
                 if not self._is_paper:
-                    state.yes.was_ever_filled = True  # live: assume fill
+                    state.yes.was_ever_filled = True
+                    state.yes.first_fill_time = time.monotonic()
             state.yes.last_entry_price = yes_bid
             state.yes.last_entry_size = yes_size
             tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
@@ -427,7 +463,8 @@ class MarketMaker:
                 state.no.p_signal_at_entry = p_up
                 state.no.was_ever_active = True
                 if not self._is_paper:
-                    state.no.was_ever_filled = True  # live: assume fill
+                    state.no.was_ever_filled = True
+                    state.no.first_fill_time = time.monotonic()
             state.no.last_entry_price = no_bid
             state.no.last_entry_size = no_size
             tasks.append(self._refresh_side(state.no, no_bid, no_size))
@@ -481,6 +518,7 @@ class MarketMaker:
                 continue
             if side.order.price >= ask:
                 side.was_ever_filled = True
+                side.first_fill_time = time.monotonic()
                 log.info(
                     "Paper FILL | %s @ %.4f (market ask=%.4f)",
                     side.side_label, side.order.price, ask,
