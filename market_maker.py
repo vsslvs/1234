@@ -38,7 +38,7 @@ from typing import Optional
 from bot_state import state as dashboard_state, TradeSnapshot
 from config import Config
 from market_calculator import BtcMarket, MarketCalculator
-from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
+from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
 from stats import BotStats
 from ws_orderbook import OrderBookWS
 
@@ -67,6 +67,12 @@ class MarketSide:
         self.last_entry_price:   float = 0.0     # price of most recent order
         self.last_entry_size:    float = 0.0     # USDC size of most recent order
 
+        # Sell-side exit: order to sell filled tokens during hedge timeout
+        self.sell_order: Optional[MakerOrder] = None
+        # Stop-loss: True if position was exited early via stop-loss
+        self.stopped_out:        bool  = False
+        self.stop_loss_pnl:      float = 0.0     # P&L from stop-loss exit
+
     @property
     def has_order(self) -> bool:
         return self.order is not None
@@ -84,6 +90,7 @@ class WindowState:
         self.market = market
         self.yes = MarketSide(market.yes_token_id, "YES")
         self.no  = MarketSide(market.no_token_id,  "NO")
+        self.stopped_out: bool = False  # True if stop-loss triggered this window
 
     def all_orders(self) -> list[MakerOrder]:
         orders = []
@@ -122,6 +129,8 @@ class MarketMaker:
         # CLOB orderbook cache (updated by _clob_poll_loop)
         self._last_yes_ask: Optional[float] = None
         self._last_no_ask:  Optional[float] = None
+        self._last_yes_bid: Optional[float] = None
+        self._last_no_bid:  Optional[float] = None
 
         # Circuit breaker state
         self._circuit_open = False
@@ -296,6 +305,8 @@ class MarketMaker:
         # Reset CLOB cache for new window
         self._last_yes_ask = None
         self._last_no_ask = None
+        self._last_yes_bid = None
+        self._last_no_bid = None
 
         self._state = WindowState(new_market)
         log.info(
@@ -342,6 +353,10 @@ class MarketMaker:
         stc = market.seconds_to_close
         elapsed = Config.MARKET_WINDOW_SEC - stc
 
+        # --- Window stopped out by stop-loss — no further quoting ---
+        if state.stopped_out:
+            return
+
         # --- Time-weighted entry: skip quiet period early in window ---
         if elapsed < Config.QUIET_PERIOD_SEC:
             return
@@ -349,6 +364,17 @@ class MarketMaker:
         # --- Fair prices and base spread ---
         fair_yes, fair_no = self._calc.fair_prices(market)
         p_up = fair_yes
+
+        # --- Stop-loss: exit early if signal reversed against filled position ---
+        if Config.STOP_LOSS_ENABLED:
+            for side in (state.yes, state.no):
+                if not side.was_ever_filled or side.stopped_out:
+                    continue
+                current_fair = p_up if side.side_label == "YES" else 1.0 - p_up
+                reversal = side.last_entry_price - current_fair
+                if reversal > Config.STOP_LOSS_THRESHOLD:
+                    await self._stop_loss_exit(state, side, current_fair)
+                    return
 
         # --- Minimum signal edge filter ---
         if abs(p_up - 0.5) < Config.MIN_SIGNAL_EDGE:
@@ -377,12 +403,18 @@ class MarketMaker:
             elapsed_since_fill = now_mono - state.yes.first_fill_time if state.yes.first_fill_time > 0 else 0.0
             if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
                 no_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
+                # Sell-side exit: try selling filled YES tokens at market bid
+                if Config.SELL_EXIT_ENABLED:
+                    await self._try_sell_exit(state.yes, self._last_yes_bid)
             else:
                 no_spread *= (1.0 - self._INVENTORY_SKEW)
         elif state.no.was_ever_filled and not state.yes.was_ever_filled:
             elapsed_since_fill = now_mono - state.no.first_fill_time if state.no.first_fill_time > 0 else 0.0
             if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
                 yes_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
+                # Sell-side exit: try selling filled NO tokens at market bid
+                if Config.SELL_EXIT_ENABLED:
+                    await self._try_sell_exit(state.no, self._last_no_bid)
             else:
                 yes_spread *= (1.0 - self._INVENTORY_SKEW)
 
@@ -493,6 +525,8 @@ class MarketMaker:
                 )
                 self._last_yes_ask = yes_p.get("best_ask")
                 self._last_no_ask  = no_p.get("best_ask")
+                self._last_yes_bid = yes_p.get("best_bid")
+                self._last_no_bid  = no_p.get("best_bid")
 
                 # Update dashboard
                 dashboard_state.market_yes_ask = self._last_yes_ask
@@ -525,6 +559,118 @@ class MarketMaker:
                 )
 
     # ------------------------------------------------------------------
+    # Stop-loss & sell-side exit
+    # ------------------------------------------------------------------
+
+    async def _stop_loss_exit(self, state: WindowState, side: MarketSide, current_fair: float) -> None:
+        """
+        Exit a filled position early when the signal reverses beyond threshold.
+
+        Instead of waiting for binary resolution (win=+profit, loss=-size),
+        we approximate P&L as if we sold at current fair value:
+            pnl = shares × (current_fair - entry_price)
+        This caps the loss and avoids full binary wipeout.
+        """
+        entry_price = side.last_entry_price
+        size_usdc = side.last_entry_size
+        shares = size_usdc / entry_price
+        pnl = shares * (current_fair - entry_price)
+
+        log.warning(
+            "STOP-LOSS | %s filled@%.2f → fair=%.2f | reversal=%.2f | "
+            "shares=%.1f | P&L=%.2f USDC",
+            side.side_label, entry_price, current_fair,
+            entry_price - current_fair, shares, pnl,
+        )
+
+        # Cancel all orders for this window
+        await self._cancel_window(state)
+
+        # Record as a loss with custom P&L
+        self._stats.record_trade(
+            window_start=state.market.window_start,
+            side=side.side_label,
+            entry_price=entry_price,
+            size_usdc=size_usdc,
+            p_signal=side.p_signal_at_entry,
+            won=False,
+            pnl_override=pnl,
+        )
+
+        # Paper mode: adjust balance
+        if hasattr(self._client, 'resolve_trade'):
+            self._client.balance += pnl
+            self._client._total_pnl += pnl
+            self._client._trade_count += 1
+
+        # Update dashboard
+        dashboard_state.recent_trades.append(TradeSnapshot(
+            timestamp=time.time(),
+            window_start=state.market.window_start,
+            side=side.side_label,
+            entry_price=entry_price,
+            size_usdc=size_usdc,
+            p_signal=side.p_signal_at_entry,
+            won=False,
+            pnl=pnl,
+        ))
+        if len(dashboard_state.recent_trades) > 50:
+            dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
+
+        # Mark as stopped out to prevent double evaluation at rollover
+        side.stopped_out = True
+        side.stop_loss_pnl = pnl
+        side.was_ever_filled = False  # prevent _evaluate_and_record_window from re-counting
+        state.stopped_out = True
+        dashboard_state.stop_losses += 1
+
+    async def _try_sell_exit(self, filled_side: MarketSide, market_bid: Optional[float]) -> None:
+        """
+        Place a SELL order on the filled token to exit the position.
+
+        Called during hedge timeout when one side is filled but the opposite
+        hasn't. Selling the filled token caps losses instead of relying on
+        the opposite BUY to fill.
+        """
+        if filled_side.sell_order is not None:
+            return  # already placed a sell order
+        if filled_side.stopped_out:
+            return
+        if market_bid is None or market_bid <= 0.01:
+            return
+
+        entry_price = filled_side.last_entry_price
+        size_usdc = filled_side.last_entry_size
+        if entry_price <= 0 or size_usdc <= 0:
+            return
+
+        # Calculate shares held and USDC received from selling
+        shares = size_usdc / entry_price
+        sell_price = market_bid
+        sell_size_usdc = round(shares * sell_price, 2)
+
+        if sell_size_usdc < 1.0:
+            return  # too small to bother
+
+        try:
+            order = await self._client.place_maker_order(
+                token_id=filled_side.token_id,
+                side=SIDE_SELL,
+                price=sell_price,
+                size_usdc=sell_size_usdc,
+            )
+            if order:
+                filled_side.sell_order = order
+                log.info(
+                    "SELL EXIT | %s @ %.4f (entry was %.4f) | "
+                    "shares=%.1f | usdc_out=%.2f",
+                    filled_side.side_label, sell_price, entry_price,
+                    shares, sell_size_usdc,
+                )
+        except Exception as exc:
+            log.error("sell_exit %s failed: %s", filled_side.side_label, exc)
+
+    # ------------------------------------------------------------------
     # Window evaluation
     # ------------------------------------------------------------------
 
@@ -545,7 +691,7 @@ class MarketMaker:
         both_filled = state.yes.was_ever_filled and state.no.was_ever_filled
 
         for side in (state.yes, state.no):
-            if not side.was_ever_filled:
+            if not side.was_ever_filled or side.stopped_out:
                 continue
             signal_is_up = (side.side_label == "YES")
             won = (btc_closed_up == signal_is_up)
@@ -579,9 +725,9 @@ class MarketMaker:
                 dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
 
         # Log summary for windows where at least one side was active
-        if state.yes.was_ever_active or state.no.was_ever_active:
-            yes_fill = "FILL" if state.yes.was_ever_filled else "no-fill"
-            no_fill  = "FILL" if state.no.was_ever_filled else "no-fill"
+        if state.yes.was_ever_active or state.no.was_ever_active or state.stopped_out:
+            yes_fill = "STOP" if state.yes.stopped_out else ("FILL" if state.yes.was_ever_filled else "no-fill")
+            no_fill  = "STOP" if state.no.stopped_out else ("FILL" if state.no.was_ever_filled else "no-fill")
             if both_filled:
                 yes_p = state.yes.last_entry_price or 0
                 no_p  = state.no.last_entry_price or 0
@@ -641,6 +787,11 @@ class MarketMaker:
             tasks.append(self._cancel_side(state.yes))
         if state.no.order:
             tasks.append(self._cancel_side(state.no))
+        # Cancel sell-side exit orders too
+        for side in (state.yes, state.no):
+            if side.sell_order:
+                tasks.append(self._client.cancel_order(side.sell_order.order_id))
+                side.sell_order = None
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
             log.info("Cancelled %d order(s) for window %s", len(tasks), state.market.window_start)

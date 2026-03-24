@@ -64,6 +64,7 @@ class BotState:
     total_trades: int = 0
     wins: int = 0
     losses: int = 0
+    stop_losses: int = 0
     total_pnl: float = 0.0
     win_rate: float = 0.0
     rolling_win_rate: float = 0.0
@@ -105,6 +106,7 @@ class BotState:
             "total_trades": self.total_trades,
             "wins": self.wins,
             "losses": self.losses,
+            "stop_losses": self.stop_losses,
             "total_pnl": round(self.total_pnl, 2),
             "win_rate": round(self.win_rate * 100, 1),
             "rolling_win_rate": round(self.rolling_win_rate * 100, 1),

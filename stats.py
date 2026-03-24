@@ -80,10 +80,18 @@ class BotStats:
         size_usdc:    float,
         p_signal:     float,
         won:          bool,
+        pnl_override: Optional[float] = None,
     ) -> None:
-        """Record one resolved trade and log the outcome."""
+        """Record one resolved trade and log the outcome.
+
+        If pnl_override is set (e.g. stop-loss exit), use that instead of
+        the standard binary payout calculation.
+        """
         shares = size_usdc / entry_price
-        pnl    = shares * (1.0 - entry_price) if won else -size_usdc
+        if pnl_override is not None:
+            pnl = pnl_override
+        else:
+            pnl = shares * (1.0 - entry_price) if won else -size_usdc
         record = TradeRecord(
             window_start=window_start,
             side=side,

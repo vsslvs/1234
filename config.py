@@ -52,7 +52,7 @@ class Config:
     # Time-weighted entry: skip quoting in the first QUIET_PERIOD_SEC of
     # each window.  Early in the window the signal is ≈ 50/50 and spread
     # is at its widest → fills are unlikely and carry high adverse selection.
-    QUIET_PERIOD_SEC: int = _get("QUIET_PERIOD_SEC", "60", int)
+    QUIET_PERIOD_SEC: int = _get("QUIET_PERIOD_SEC", "35", int)
 
     # Minimum |p_up - 0.5| before the bot will quote.  Prevents placing
     # orders when the signal is essentially a coin flip.
@@ -99,9 +99,20 @@ class Config:
     # --- Phase 3: Hedge timeout ---
     # Seconds after first fill to wait for the hedge side to fill.
     # If hedge doesn't fill within this window, aggressively tighten spread.
-    HEDGE_TIMEOUT_SEC: float = _get("HEDGE_TIMEOUT_SEC", "60", float)
+    HEDGE_TIMEOUT_SEC: float = _get("HEDGE_TIMEOUT_SEC", "25", float)
     # Spread multiplier for the aggressive hedge tightening phase (0.3 = 30% of normal spread).
     HEDGE_AGGRESSIVE_SPREAD_MULT: float = _get("HEDGE_AGGRESSIVE_SPREAD_MULT", "0.3", float)
+
+    # --- Stop-loss: early exit on adverse signal reversal ---
+    # If the fair value of a filled position drops below entry_price by more
+    # than this threshold, exit early instead of waiting for binary resolution.
+    STOP_LOSS_ENABLED: bool = _get("STOP_LOSS_ENABLED", "true", lambda v: v.lower() in ("true", "1", "yes"))
+    STOP_LOSS_THRESHOLD: float = _get("STOP_LOSS_THRESHOLD", "0.12", float)
+
+    # --- Sell-side exit: sell filled tokens during hedge timeout ---
+    # When hedge timeout fires and we hold a one-sided position, place a SELL
+    # order on the filled token at market bid to close the position and cap losses.
+    SELL_EXIT_ENABLED: bool = _get("SELL_EXIT_ENABLED", "true", lambda v: v.lower() in ("true", "1", "yes"))
 
     # 5-minute BTC markets: 288 per day, each window = 300 seconds
     MARKET_WINDOW_SEC: int = 300
