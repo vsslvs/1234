@@ -50,6 +50,7 @@ class TradeRecord:
     p_signal:     float  # p_up probability at entry
     won:          bool   # True if BTC closed in our predicted direction
     pnl:          float  # approximate realised P&L in USDC
+    fee:          float  # Polymarket fee paid (USDC)
 
 
 class BotStats:
@@ -65,6 +66,8 @@ class BotStats:
         self._wins:      int   = 0
         self._losses:    int   = 0
         self._total_pnl: float = 0.0
+        self._total_fees: float = 0.0
+        self._total_maker_rebate_est: float = 0.0
         self._session_start: float = time.time()
 
     # ------------------------------------------------------------------
@@ -81,17 +84,19 @@ class BotStats:
         p_signal:     float,
         won:          bool,
         pnl_override: Optional[float] = None,
+        fee:          float = 0.0,
     ) -> None:
         """Record one resolved trade and log the outcome.
 
         If pnl_override is set (e.g. stop-loss exit), use that instead of
         the standard binary payout calculation.
+        fee: Polymarket fee charged on entry (USDC).
         """
         shares = size_usdc / entry_price
         if pnl_override is not None:
             pnl = pnl_override
         else:
-            pnl = shares * (1.0 - entry_price) if won else -size_usdc
+            pnl = shares * (1.0 - entry_price) - fee if won else -size_usdc
         record = TradeRecord(
             window_start=window_start,
             side=side,
@@ -100,6 +105,7 @@ class BotStats:
             p_signal=p_signal,
             won=won,
             pnl=pnl,
+            fee=fee,
         )
         self._trades.append(record)
         if won:
@@ -107,11 +113,18 @@ class BotStats:
         else:
             self._losses += 1
         self._total_pnl += pnl
+        self._total_fees += fee
+
+        # Estimate maker rebate: MAKER_REBATE_PCT of fee pool flows back to makers.
+        # This is an approximation — actual rebate depends on our share of maker volume.
+        from config import Config
+        self._total_maker_rebate_est += fee * Config.MAKER_REBATE_PCT
+
         log.info(
             "Trade  window=%d  side=%-3s  @%.4f  signal=%.1f%%  ->  %-4s  "
-            "P&L=%+.2f USDC  (session: %d/%d  rate=%.1f%%)",
+            "P&L=%+.2f USDC  fee=%.4f  (session: %d/%d  rate=%.1f%%)",
             window_start, side, entry_price, p_signal * 100,
-            "WIN" if won else "LOSS", pnl,
+            "WIN" if won else "LOSS", pnl, fee,
             self._wins, self.total_trades,
             (self.win_rate or 0.0) * 100,
         )
@@ -208,6 +221,9 @@ class BotStats:
             "  Avg entry price        : %.4f  (break-even: %.1f%%)\n"
             "  EV/trade  (actual)     : %+.3f USDC\n"
             "  Total P&L              : %+.2f USDC\n"
+            "  Total fees paid        : %.4f USDC\n"
+            "  Est. maker rebate      : %.4f USDC\n"
+            "  Net P&L (incl rebate)  : %+.2f USDC\n"
             "  Two-sided fills        : %d windows",
             uptime_h, self.total_trades,
             self._wins, self._losses,
@@ -216,5 +232,8 @@ class BotStats:
             avg_entry, avg_entry * 100,
             ev_actual,
             self._total_pnl,
+            self._total_fees,
+            self._total_maker_rebate_est,
+            self._total_pnl + self._total_maker_rebate_est,
             two_sided,
         )

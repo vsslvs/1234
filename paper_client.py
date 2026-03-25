@@ -26,6 +26,7 @@ from typing import Deque, Dict, List, Optional
 import aiohttp
 
 from config import Config
+from market_calculator import compute_fee
 from polymarket_client import MakerOrder, SIDE_BUY
 
 log = logging.getLogger(__name__)
@@ -186,15 +187,21 @@ class PaperClient:
         """
         Resolve a paper trade outcome and update balance.
 
+        Includes Polymarket fee simulation using the exact formula:
+          fee = C × p × feeRate × (p × (1-p))^exponent
+        Fee is charged on the buy (entry), deducted from payout.
+
         The stake was already deducted on place and refunded on cancel.
         This method applies only the P&L delta:
-          win:  balance += (payout - size)  where payout = size/price
+          win:  balance += (payout - size - fee)
           loss: balance += (-size)
         """
+        shares = size_usdc / entry_price
+        fee = compute_fee(shares, entry_price)
+
         if won:
-            shares = size_usdc / entry_price
             payout = shares * 1.0  # each winning share pays $1
-            pnl = payout - size_usdc
+            pnl = payout - size_usdc - fee
         else:
             pnl = -size_usdc
 

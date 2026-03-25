@@ -44,10 +44,18 @@ class Config:
     # 60% annualised → σ₅ = 60% / √(252 × 24 × 12) ≈ 0.22%.
     SIGMA_5M: float = _get("SIGMA_5M", "0.0022", float)
 
-    # Estimated Polymarket fee in price units.  Used to widen the spread
-    # in live mode so the fee doesn't eat into our edge.  Paper mode
-    # ignores this (fees = 0).  Typical maker fee is ~1-2%.
-    LIVE_FEE_ESTIMATE: float = _get("LIVE_FEE_ESTIMATE", "0.015", float)
+    # --- Polymarket fee model (exact formula) ---
+    # fee = C × p × feeRate × (p × (1-p))^exponent
+    # where C = shares, p = entry price.
+    # These default to current Crypto category values.
+    # On 2026-03-30 Polymarket updates: feeRate→0.072, exponent→1.
+    FEE_RATE: float = _get("FEE_RATE", "0.25", float)
+    FEE_EXPONENT: int = _get("FEE_EXPONENT", "2", int)
+    MAKER_REBATE_PCT: float = _get("MAKER_REBATE_PCT", "0.20", float)
+
+    # Cache TTL for fee-rate API calls (seconds).
+    # feeRateBps changes very rarely — no need to poll every 5s.
+    FEE_CACHE_TTL_SEC: float = _get("FEE_CACHE_TTL_SEC", "300", float)
 
     # Time-weighted entry: skip quoting in the first QUIET_PERIOD_SEC of
     # each window.  Early in the window the signal is ≈ 50/50 and spread

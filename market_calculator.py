@@ -56,6 +56,38 @@ def _phi(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / _SQRT2))
 
 
+# ---------------------------------------------------------------------------
+# Polymarket fee helpers
+# ---------------------------------------------------------------------------
+
+def compute_fee(shares: float, price: float, fee_rate: float = None,
+                exponent: int = None) -> float:
+    """
+    Exact Polymarket fee: fee = C × p × feeRate × (p × (1-p))^exponent.
+
+    Returns fee in USDC.
+    """
+    if fee_rate is None:
+        fee_rate = Config.FEE_RATE
+    if exponent is None:
+        exponent = Config.FEE_EXPONENT
+    if price <= 0 or price >= 1:
+        return 0.0
+    return shares * price * fee_rate * (price * (1.0 - price)) ** exponent
+
+
+def compute_fee_per_share(price: float, fee_rate: float = None,
+                          exponent: int = None) -> float:
+    """Fee per share at a given entry price (in USDC/share)."""
+    if fee_rate is None:
+        fee_rate = Config.FEE_RATE
+    if exponent is None:
+        exponent = Config.FEE_EXPONENT
+    if price <= 0 or price >= 1:
+        return 0.0
+    return price * fee_rate * (price * (1.0 - price)) ** exponent
+
+
 @dataclass
 class BtcMarket:
     """One 5-minute BTC up/down market."""
@@ -336,24 +368,27 @@ class MarketCalculator:
         base_size: float,
     ) -> float:
         """
-        Half-Kelly position sizing for binary options.
+        Half-Kelly position sizing for binary options, fee-aware.
 
-        For a binary option bought at price p with true probability w:
-            Kelly fraction f* = w - p  (= edge / odds)
-            Half-Kelly = f* / 2   (halved for safety — reduces variance ~75%)
+        Subtracts expected fee per share from the gross edge before
+        computing Kelly fraction.  This reduces position size when fees
+        eat into the edge (low-signal entries near p=0.50) and has
+        minimal impact when fees are negligible (high-signal entries).
 
         The result is clamped to [MIN_MULT, MAX_MULT] × base_size.
-        Returns 0 if there is no edge (p_signal <= entry_price).
+        Returns 0 if there is no net edge after fees.
         """
         if Config.KELLY_FRACTION <= 0:
             return base_size
 
-        edge = p_signal - entry_price
-        if edge <= 0:
+        # Subtract fee from gross edge
+        fee_ps = compute_fee_per_share(entry_price)
+        net_edge = p_signal - entry_price - fee_ps
+        if net_edge <= 0:
             return 0.0
 
-        # f* = edge / (1 - entry_price)  is the full Kelly for binary payoff
-        kelly_f = edge / (1.0 - entry_price) if entry_price < 1.0 else 0.0
+        # f* = net_edge / (1 - entry_price)  is the full Kelly for binary payoff
+        kelly_f = net_edge / (1.0 - entry_price) if entry_price < 1.0 else 0.0
         half_kelly = kelly_f * 0.5 * Config.KELLY_FRACTION
 
         # Map half_kelly [0..~0.5] → size multiplier [MIN..MAX]
@@ -371,20 +406,24 @@ class MarketCalculator:
         min_spread_price: float,
     ) -> float:
         """
-        Compute bid price aware of real Polymarket CLOB ask.
+        Compute bid price aware of real Polymarket CLOB ask and fees.
 
         Logic:
         - Base bid = fair - spread (our normal pricing)
         - If CLOB ask is known and lower than base bid, we cap our bid
           at (market_ask - MIN_EDGE) to avoid overpaying.
-        - Never bid above (fair - min_spread) to preserve minimum edge.
+        - Never bid above (fair - min_spread - fee) to preserve minimum
+          net edge after fees.
 
         This increases fill rate (we sit closer to the ask when it's tight)
         while preventing overpayment (we never cross the ask needlessly).
         """
         MIN_EDGE = 0.005  # 0.5¢ minimum below market ask
         base_bid = fair - spread
-        ceiling = fair - min_spread_price
+        # Ceiling accounts for fee at the ceiling price to ensure net edge
+        raw_ceiling = fair - min_spread_price
+        fee_at_ceiling = compute_fee_per_share(raw_ceiling)
+        ceiling = raw_ceiling - fee_at_ceiling
 
         if market_ask is not None and market_ask > 0:
             orderbook_bid = market_ask - MIN_EDGE

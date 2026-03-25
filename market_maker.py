@@ -37,7 +37,7 @@ from typing import Optional
 
 from bot_state import state as dashboard_state, TradeSnapshot
 from config import Config
-from market_calculator import BtcMarket, MarketCalculator
+from market_calculator import BtcMarket, MarketCalculator, compute_fee_per_share, compute_fee
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
 from stats import BotStats
 from ws_orderbook import OrderBookWS
@@ -385,10 +385,6 @@ class MarketMaker:
 
         base_spread = self._calc.dynamic_spread(market)
 
-        # --- Fee-aware spread: widen in live mode to cover CLOB fees ---
-        if not self._is_paper:
-            base_spread += Config.LIVE_FEE_ESTIMATE
-
         min_spread_price = Config.MIN_SPREAD_BPS / 10_000
 
         # --- Inventory skew + hedge timeout ---
@@ -430,14 +426,29 @@ class MarketMaker:
             min_spread_price=min_spread_price,
         )
 
+        # --- Fee-aware spread: widen bids to cover exact Polymarket fee ---
+        # Instead of a fixed 1.5¢ constant, compute the actual fee per share
+        # at each bid price.  This adds more spread where fees are high (p≈0.50)
+        # and almost nothing where fees are negligible (p≈0.90+).
+        if not self._is_paper:
+            yes_fee_adj = compute_fee_per_share(yes_bid)
+            no_fee_adj  = compute_fee_per_share(no_bid)
+            yes_bid = round(yes_bid - yes_fee_adj, 2)
+            no_bid  = round(no_bid  - no_fee_adj, 2)
+
         # Cap at MAX_ENTRY_PRICE
         yes_bid = min(yes_bid, Config.MAX_ENTRY_PRICE)
         no_bid  = min(no_bid,  Config.MAX_ENTRY_PRICE)
 
-        # Guarantee: bid_yes + bid_no < 1.0 (profit if both fill)
-        total = yes_bid + no_bid
-        if total >= 1.0:
-            scale = 0.98 / total
+        # Guarantee: bid_yes + bid_no + fees < 1.0 (profit if both fill).
+        # The old check ignored fees, so two-sided fills could be net-negative.
+        yes_shares = Config.ORDER_SIZE_USDC / yes_bid if yes_bid > 0 else 0
+        no_shares  = Config.ORDER_SIZE_USDC / no_bid  if no_bid  > 0 else 0
+        fee_yes = compute_fee(yes_shares, yes_bid) / yes_shares if yes_shares > 0 else 0
+        fee_no  = compute_fee(no_shares,  no_bid)  / no_shares  if no_shares  > 0 else 0
+        total_cost = yes_bid + no_bid + fee_yes + fee_no
+        if total_cost >= 1.0:
+            scale = 0.98 / total_cost
             yes_bid = round(yes_bid * scale, 2)
             no_bid  = round(no_bid  * scale, 2)
 
@@ -698,6 +709,9 @@ class MarketMaker:
             entry_price = side.last_entry_price if side.last_entry_price > 0 else 0.01
             size_usdc = side.last_entry_size if side.last_entry_size > 0 else Config.ORDER_SIZE_USDC
 
+            shares = size_usdc / entry_price
+            fee = compute_fee(shares, entry_price)
+
             self._stats.record_trade(
                 window_start=market.window_start,
                 side=side.side_label,
@@ -705,12 +719,12 @@ class MarketMaker:
                 size_usdc=size_usdc,
                 p_signal=side.p_signal_at_entry,
                 won=won,
+                fee=fee,
             )
             if hasattr(self._client, 'resolve_trade'):
                 self._client.resolve_trade(won, size_usdc, entry_price)
 
-            shares = size_usdc / entry_price
-            pnl = shares * (1.0 - entry_price) if won else -size_usdc
+            pnl = shares * (1.0 - entry_price) - fee if won else -size_usdc
             dashboard_state.recent_trades.append(TradeSnapshot(
                 timestamp=time.time(),
                 window_start=market.window_start,

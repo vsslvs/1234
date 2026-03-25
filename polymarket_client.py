@@ -83,7 +83,9 @@ class FeeRate:
     fee_rate_bps: int
     fetched_at: float   # monotonic — used to decide if cache is stale
 
-    def is_fresh(self, max_age_sec: float = 5.0) -> bool:
+    def is_fresh(self, max_age_sec: float = None) -> bool:
+        if max_age_sec is None:
+            max_age_sec = Config.FEE_CACHE_TTL_SEC
         return (time.monotonic() - self.fetched_at) < max_age_sec
 
 
