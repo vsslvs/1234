@@ -50,6 +50,23 @@ WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 
 _SQRT2 = math.sqrt(2.0)
 
+# Time-of-day BTC volatility multipliers (UTC hour → relative vol)
+_TOD_MAP = {
+    0: 0.85, 1: 0.85, 2: 0.85, 3: 0.85,
+    4: 0.90, 5: 0.95, 6: 0.95, 7: 1.05,
+    8: 1.05, 9: 1.05, 10: 1.00, 11: 1.00,
+    12: 1.05, 13: 1.15, 14: 1.20, 15: 1.15,
+    16: 1.10, 17: 1.05, 18: 1.00, 19: 0.95,
+    20: 0.90, 21: 0.90, 22: 0.90, 23: 0.85,
+}
+
+
+def _tod_vol_multiplier() -> float:
+    """Time-of-day volatility multiplier based on empirical BTC patterns."""
+    from datetime import datetime, timezone
+    hour = datetime.now(timezone.utc).hour
+    return _TOD_MAP.get(hour, 1.0)
+
 
 def _phi(z: float) -> float:
     """Standard normal CDF: Φ(z) = 0.5 × (1 + erf(z/√2))."""
@@ -288,12 +305,15 @@ class MarketCalculator:
         """
         Estimate P(BTC closes UP) for the current window.
 
-        Uses a random-walk model:
-            p_up = Φ( ret / σ_remaining )
+        Core model: p_up = Φ( ret / σ_remaining )
 
-        where σ_remaining = σ₅ × √(seconds_to_close / 300).
-        The same BTC return gives HIGHER p_up near close (less time
-        for reversal) — this is the key improvement over a fixed-K logistic.
+        Enhancements layered on top:
+          1. Mean reversion (O-U dampening of ret)
+          2. Time-of-day volatility adjustment
+          3. Volume-weighted sigma confidence
+          4. Adaptive multi-timeframe trend bias
+          5. Order Book Imbalance (OBI) shift
+          6. Candle close location pattern
         """
         mid = self._ob_ws.book.mid_price
         if mid is None:
@@ -307,31 +327,58 @@ class MarketCalculator:
 
         stc = market.seconds_to_close
         if stc <= 0.5:
-            # Window essentially closed — return certainty
             return 1.0 if ret > 0 else (0.0 if ret < 0 else 0.5)
 
+        # --- Mean reversion adjustment (O-U) ---
+        kappa = Config.MEAN_REVERSION_KAPPA
+        if kappa > 0:
+            mean_ret = self._ob_ws.mean_return_5m
+            ret = ret * (1.0 - kappa) + mean_ret * kappa
+
+        # --- Sigma with time-of-day adjustment ---
         sigma = self._ob_ws.realized_sigma_5m
+        if Config.TOD_VOL_ADJUST_ENABLED:
+            sigma *= _tod_vol_multiplier()
+
         sigma_remaining = sigma * math.sqrt(stc / WINDOW_SEC)
+
+        # --- Volume-adjusted confidence ---
+        vol_w = Config.VOLUME_CONFIDENCE_WEIGHT
+        if vol_w > 0:
+            vol_ratio = self._ob_ws.volume_ratio
+            vol_factor = 1.0 - vol_w * (vol_ratio - 1.0)
+            vol_factor = max(0.7, min(1.3, vol_factor))
+            sigma_remaining *= vol_factor
+
         if sigma_remaining < 1e-10:
             return 0.5
 
         z = ret / sigma_remaining
-        # Clamp z to avoid extreme probabilities that cause numerical issues
         z = max(-6.0, min(6.0, z))
         p = _phi(z)
 
-        # --- Multi-timeframe trend bias (Phase 3) ---
-        # Blend hourly trend into the 5m signal.  The bias shifts p_up
-        # toward the hourly direction, helping the bot align with the
-        # dominant trend and reducing adverse selection.
-        w = Config.TREND_BIAS_WEIGHT
-        if w > 0:
+        # --- Adaptive multi-timeframe trend bias ---
+        w_min = Config.TREND_WEIGHT_MIN
+        w_max = Config.TREND_WEIGHT_MAX
+        if w_max > 0:
             bias = self._ob_ws.hourly_trend_bias  # [-1, +1]
-            # Map bias to a probability shift: +1 → push p toward 1.0
-            # Using a simple linear blend: p' = p * (1-w) + target * w
-            # where target = 0.5 + 0.5*bias (maps [-1,+1] → [0,1])
+            trend_strength = abs(bias)
+            w = w_min + (w_max - w_min) * trend_strength
             trend_target = 0.5 + 0.5 * bias
             p = p * (1.0 - w) + trend_target * w
+
+        # --- Order Book Imbalance adjustment ---
+        obi_w = Config.OBI_WEIGHT
+        if obi_w > 0:
+            obi = self._ob_ws.smoothed_obi
+            p = p + obi_w * obi
+
+        # --- Candle close location bias ---
+        cp_w = Config.CANDLE_PATTERN_WEIGHT
+        if cp_w > 0:
+            cl = self._ob_ws.last_candle_close_location
+            cl_bias = (cl - 0.5) * 2.0 * cp_w
+            p = p + cl_bias
 
         return max(0.01, min(0.99, p))
 

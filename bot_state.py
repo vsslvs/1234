@@ -48,7 +48,10 @@ class BotState:
     spread: float = 0.0          # current dynamic spread in price units
     realized_sigma: float = 0.0  # adaptive 5m vol from closed candles
     hourly_trend_bias: float = 0.0  # 1h trend bias [-1, +1]
-    hedge_timeout_active: bool = False  # True when hedge rush mode is engaged
+    obi: float = 0.0                    # smoothed order book imbalance
+    vol_regime: str = "normal"           # calm / normal / storm
+    volume_ratio: float = 1.0           # current vs median volume
+    hedge_timeout_active: bool = False   # True when hedge rush mode is engaged
 
     # Orders
     yes_order_active: bool = False
@@ -96,6 +99,9 @@ class BotState:
             "spread": round(self.spread, 4),
             "realized_sigma": round(self.realized_sigma, 6),
             "hourly_trend_bias": round(self.hourly_trend_bias, 4),
+            "obi": round(self.obi, 4),
+            "vol_regime": self.vol_regime,
+            "volume_ratio": round(self.volume_ratio, 2),
             "hedge_timeout_active": self.hedge_timeout_active,
             "yes_order_active": self.yes_order_active,
             "no_order_active": self.no_order_active,

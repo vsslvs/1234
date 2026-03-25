@@ -264,6 +264,9 @@ class MarketMaker:
         ds.spread = spread
         ds.realized_sigma = self._ob_ws.realized_sigma_5m
         ds.hourly_trend_bias = self._ob_ws.hourly_trend_bias
+        ds.obi = self._ob_ws.smoothed_obi
+        ds.vol_regime = self._ob_ws.vol_regime
+        ds.volume_ratio = self._ob_ws.volume_ratio
 
         # Hedge timeout status
         hedge_active = False
@@ -365,14 +368,20 @@ class MarketMaker:
         fair_yes, fair_no = self._calc.fair_prices(market)
         p_up = fair_yes
 
-        # --- Stop-loss: exit early if signal reversed against filled position ---
-        if Config.STOP_LOSS_ENABLED:
+        # --- Adaptive stop-loss: threshold = f(σ, stc) ---
+        if Config.STOP_LOSS_ENABLED and stc > Config.STOP_LOSS_MIN_STC:
+            sigma = self._ob_ws.realized_sigma_5m
+            base_sl = Config.STOP_LOSS_BASE
+            vol_adj = Config.STOP_LOSS_VOL_SCALE * (sigma / 0.002)
+            time_factor = max(0.3, min(1.0, stc / 120.0))
+            threshold = (base_sl + vol_adj) * time_factor
+
             for side in (state.yes, state.no):
                 if not side.was_ever_filled or side.stopped_out:
                     continue
                 current_fair = p_up if side.side_label == "YES" else 1.0 - p_up
                 reversal = side.last_entry_price - current_fair
-                if reversal > Config.STOP_LOSS_THRESHOLD:
+                if reversal > threshold:
                     await self._stop_loss_exit(state, side, current_fair)
                     return
 
@@ -385,30 +394,41 @@ class MarketMaker:
 
         base_spread = self._calc.dynamic_spread(market)
 
+        # --- Volatility regime adjustment ---
+        vol_regime = self._ob_ws.vol_regime
+        if vol_regime == "storm":
+            base_spread *= Config.VOL_REGIME_STORM_SPREAD_MULT
+        elif vol_regime == "calm":
+            base_spread *= Config.VOL_REGIME_CALM_SPREAD_MULT
+
         min_spread_price = Config.MIN_SPREAD_BPS / 10_000
 
-        # --- Inventory skew + hedge timeout ---
-        # Normal skew: reduce spread on unfilled hedge side to attract fills.
-        # Hedge timeout: if one side filled but hedge hasn't filled within
-        # HEDGE_TIMEOUT_SEC, aggressively tighten the hedge side spread.
+        # --- Inventory skew + smart hedge timeout ---
         yes_spread = base_spread
         no_spread = base_spread
         now_mono = time.monotonic()
 
+        # Dynamic timeout: fraction of remaining time, capped by HEDGE_TIMEOUT_SEC
+        dynamic_timeout = max(5.0, min(Config.HEDGE_TIMEOUT_SEC, stc * Config.HEDGE_TIMEOUT_FRAC))
+
+        def _should_aggressive_hedge(filled_side: MarketSide) -> bool:
+            if not Config.HEDGE_ONLY_IF_LOSING:
+                return True
+            current_fair = p_up if filled_side.side_label == "YES" else 1.0 - p_up
+            return filled_side.last_entry_price > current_fair + 0.02
+
         if state.yes.was_ever_filled and not state.no.was_ever_filled:
             elapsed_since_fill = now_mono - state.yes.first_fill_time if state.yes.first_fill_time > 0 else 0.0
-            if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
+            if elapsed_since_fill > dynamic_timeout and _should_aggressive_hedge(state.yes):
                 no_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
-                # Sell-side exit: try selling filled YES tokens at market bid
                 if Config.SELL_EXIT_ENABLED:
                     await self._try_sell_exit(state.yes, self._last_yes_bid)
             else:
                 no_spread *= (1.0 - self._INVENTORY_SKEW)
         elif state.no.was_ever_filled and not state.yes.was_ever_filled:
             elapsed_since_fill = now_mono - state.no.first_fill_time if state.no.first_fill_time > 0 else 0.0
-            if elapsed_since_fill > Config.HEDGE_TIMEOUT_SEC:
+            if elapsed_since_fill > dynamic_timeout and _should_aggressive_hedge(state.no):
                 yes_spread *= Config.HEDGE_AGGRESSIVE_SPREAD_MULT
-                # Sell-side exit: try selling filled NO tokens at market bid
                 if Config.SELL_EXIT_ENABLED:
                     await self._try_sell_exit(state.no, self._last_no_bid)
             else:
@@ -456,6 +476,11 @@ class MarketMaker:
         yes_size = self._calc.kelly_size(p_up, yes_bid, Config.ORDER_SIZE_USDC)
         no_size  = self._calc.kelly_size(1.0 - p_up, no_bid, Config.ORDER_SIZE_USDC)
 
+        # --- Vol regime size reduction ---
+        if vol_regime == "storm":
+            yes_size *= Config.VOL_REGIME_STORM_SIZE_MULT
+            no_size *= Config.VOL_REGIME_STORM_SIZE_MULT
+
         # --- Periodic log ---
         now = time.monotonic()
         if now - self._last_quote_log >= 5.0:
@@ -464,25 +489,25 @@ class MarketMaker:
             skew_label = ""
             if state.yes.was_ever_filled and not state.no.was_ever_filled:
                 elapsed_f = now - state.yes.first_fill_time if state.yes.first_fill_time > 0 else 0.0
-                if elapsed_f > Config.HEDGE_TIMEOUT_SEC:
+                if elapsed_f > dynamic_timeout:
                     skew_label = " [HEDGE-RUSH→NO %.0fs]" % elapsed_f
                 else:
                     skew_label = " [skew→NO]"
             elif state.no.was_ever_filled and not state.yes.was_ever_filled:
                 elapsed_f = now - state.no.first_fill_time if state.no.first_fill_time > 0 else 0.0
-                if elapsed_f > Config.HEDGE_TIMEOUT_SEC:
+                if elapsed_f > dynamic_timeout:
                     skew_label = " [HEDGE-RUSH→YES %.0fs]" % elapsed_f
                 else:
                     skew_label = " [skew→YES]"
             log.info(
                 "Quoting | BTC=%.2f  p_up=%.4f  σ=%.4f  spread=%.4f  "
                 "yes=%.2f($%.0f)  no=%.2f($%.0f)  sum=%.2f  "
-                "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs%s",
+                "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs  regime=%s%s",
                 self._ob_ws.book.mid_price or 0, p_up, sigma, base_spread,
                 yes_bid, yes_size, no_bid, no_size, yes_bid + no_bid,
                 f"{self._last_yes_ask:.2f}" if self._last_yes_ask else "?",
                 f"{self._last_no_ask:.2f}" if self._last_no_ask else "?",
-                candle_vol, stc, skew_label,
+                candle_vol, stc, vol_regime, skew_label,
             )
 
         # --- Place/refresh orders on both sides ---
