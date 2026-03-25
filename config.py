@@ -2,6 +2,7 @@
 Configuration loader for Polymarket BTC 5-minute market maker bot.
 """
 import os
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,10 +48,15 @@ class Config:
     # --- Polymarket fee model (exact formula) ---
     # fee = C × p × feeRate × (p × (1-p))^exponent
     # where C = shares, p = entry price.
-    # These default to current Crypto category values.
-    # On 2026-03-30 Polymarket updates: feeRate→0.072, exponent→1.
-    FEE_RATE: float = _get("FEE_RATE", "0.25", float)
-    FEE_EXPONENT: int = _get("FEE_EXPONENT", "2", int)
+    # Auto-detects regime: before 2026-03-30 → old (0.25, exp=2),
+    # on/after 2026-03-30 → new (0.072, exp=1).
+    # Env vars override auto-detection if explicitly set.
+    _FEE_SWITCH_DATE = datetime(2026, 3, 30, tzinfo=timezone.utc)
+    _NEW_FEE_REGIME = datetime.now(timezone.utc) >= _FEE_SWITCH_DATE
+    FEE_RATE: float = _get("FEE_RATE",
+                            "0.072" if _NEW_FEE_REGIME else "0.25", float)
+    FEE_EXPONENT: int = _get("FEE_EXPONENT",
+                              "1" if _NEW_FEE_REGIME else "2", int)
     MAKER_REBATE_PCT: float = _get("MAKER_REBATE_PCT", "0.20", float)
 
     # Cache TTL for fee-rate API calls (seconds).
@@ -119,7 +125,7 @@ class Config:
     TREND_SENSITIVITY: float = _get("TREND_SENSITIVITY", "0.01", float)
     # Adaptive trend: weight scales from MIN to MAX based on trend strength.
     TREND_WEIGHT_MIN: float = _get("TREND_WEIGHT_MIN", "0.03", float)
-    TREND_WEIGHT_MAX: float = _get("TREND_WEIGHT_MAX", "0.40", float)
+    TREND_WEIGHT_MAX: float = _get("TREND_WEIGHT_MAX", "0.15", float)
 
     # --- Candle close location pattern ---
     CANDLE_PATTERN_WEIGHT: float = _get("CANDLE_PATTERN_WEIGHT", "0.04", float)

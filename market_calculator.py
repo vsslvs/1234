@@ -343,10 +343,13 @@ class MarketCalculator:
         sigma_remaining = sigma * math.sqrt(stc / WINDOW_SEC)
 
         # --- Volume-adjusted confidence ---
+        # High volume → price moves are more "real" → REDUCE σ (more confident)
+        # Low volume  → price moves are noise    → INCREASE σ (less confident)
         vol_w = Config.VOLUME_CONFIDENCE_WEIGHT
         if vol_w > 0:
             vol_ratio = self._ob_ws.volume_ratio
-            vol_factor = 1.0 - vol_w * (vol_ratio - 1.0)
+            # vol_ratio > 1 → shrink σ (divide by >1), vol_ratio < 1 → expand σ
+            vol_factor = 1.0 / (1.0 + vol_w * (vol_ratio - 1.0))
             vol_factor = max(0.7, min(1.3, vol_factor))
             sigma_remaining *= vol_factor
 

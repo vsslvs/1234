@@ -845,10 +845,13 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self) -> None:
+        # Fast refresh on cold start (every 30s), then slow down to 5 min
+        delay = 30.0
         while self._running:
-            await asyncio.sleep(600)
+            await asyncio.sleep(delay)
             if self._running:
                 await self._refresh_market_list()
+                delay = min(delay * 2, 300.0)  # ramp: 30→60→120→240→300s
 
     async def _refresh_market_list(self) -> None:
         markets = await self._calc.fetch_upcoming_markets()
