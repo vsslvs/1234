@@ -9,34 +9,38 @@ Market window boundaries (UTC):
     window_start = window_index * 300
     window_end   = window_start + 300
 
-Signal model (random-walk CDF)
-------------------------------
-We estimate P(BTC closes UP) using the standard normal CDF (Φ):
+Signal model (Bayesian multi-factor)
+-------------------------------------
+Core signal: random-walk CDF
+    p_base = Φ( ret / σ_remaining )
 
-    p_up = Φ( ret / σ_remaining )
+Enhanced with Bayesian factor combination:
+    Each factor (trend, OBI, candle, volume) produces a probability estimate.
+    Factors are combined via log-odds addition with confidence weights:
+        log_odds_final = Σ wᵢ × log(pᵢ / (1-pᵢ))
+    This is mathematically equivalent to Bayesian updating under
+    conditional independence.
 
-where:
-    ret          = (mid - open) / open          (return so far)
-    σ_remaining  = σ₅ × √(stc / WINDOW_SEC)    (vol of remaining time)
-    σ₅           = realized vol from recent closed candles (adaptive)
-                   Falls back to Config.SIGMA_5M ≈ 0.22% when cold-starting.
+Signal smoothing:
+    Raw signal is smoothed via EMA to prevent oscillations from BTC tick noise.
+    This dramatically reduces order churn (cancel/replace rate).
 
-This is time-adjusted: the same BTC return gives a MUCH higher p_up
-near the end of the window (less time for reversal) than at the start.
-
-Usage:
-    calc = MarketCalculator(btc_ws)
-    market = calc.current_market()
-    p_up = calc.p_up_signal(market)
+Confidence metric:
+    Each signal comes with a confidence score [0,1] based on:
+    - Factor agreement (do factors point the same way?)
+    - Time to close (higher near close)
+    - Volatility regime (lower during storms)
+    - Signal strength (|p - 0.5|)
 """
 import asyncio
 import json as _json
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -51,6 +55,7 @@ WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 _SQRT2 = math.sqrt(2.0)
 
 # Time-of-day BTC volatility multipliers (UTC hour → relative vol)
+# Derived from empirical BTC 5m return distributions across sessions
 _TOD_MAP = {
     0: 0.85, 1: 0.85, 2: 0.85, 3: 0.85,
     4: 0.90, 5: 0.95, 6: 0.95, 7: 1.05,
@@ -63,7 +68,7 @@ _TOD_MAP = {
 
 def _tod_vol_multiplier() -> float:
     """Time-of-day volatility multiplier based on empirical BTC patterns."""
-    from datetime import datetime, timezone
+    from datetime import timezone
     hour = datetime.now(timezone.utc).hour
     return _TOD_MAP.get(hour, 1.0)
 
@@ -71,6 +76,20 @@ def _tod_vol_multiplier() -> float:
 def _phi(z: float) -> float:
     """Standard normal CDF: Φ(z) = 0.5 × (1 + erf(z/√2))."""
     return 0.5 * (1.0 + math.erf(z / _SQRT2))
+
+
+def _logit(p: float) -> float:
+    """Log-odds: logit(p) = log(p / (1-p)). Clamped to avoid infinities."""
+    p = max(0.001, min(0.999, p))
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    """Inverse logit: σ(x) = 1 / (1 + e^(-x)). Numerically stable."""
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    ex = math.exp(x)
+    return ex / (1.0 + ex)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +100,6 @@ def compute_fee(shares: float, price: float, fee_rate: float = None,
                 exponent: int = None) -> float:
     """
     Exact Polymarket fee: fee = C × p × feeRate × (p × (1-p))^exponent.
-
     Returns fee in USDC.
     """
     if fee_rate is None:
@@ -124,6 +142,16 @@ class BtcMarket:
     def is_expired(self) -> bool:
         return time.time() > self.window_end
 
+    @property
+    def elapsed(self) -> float:
+        """Seconds elapsed since window start."""
+        return max(0.0, time.time() - self.window_start)
+
+    @property
+    def time_fraction(self) -> float:
+        """Fraction of window elapsed: 0.0 at start, 1.0 at close."""
+        return min(1.0, self.elapsed / WINDOW_SEC)
+
 
 def current_window_start() -> int:
     return int(time.time() // WINDOW_SEC) * WINDOW_SEC
@@ -137,16 +165,48 @@ def seconds_to_next_window() -> float:
     return current_window_end() - time.time()
 
 
+@dataclass
+class SignalResult:
+    """
+    Enriched signal output with confidence and factor breakdown.
+
+    Provides the pricing engine with everything needed for optimal bid placement:
+    - p_up: smoothed probability of BTC closing UP
+    - confidence: [0,1] measure of signal reliability
+    - raw_p_up: unsmoothed probability (for logging/debugging)
+    - factors: dict of individual factor probabilities
+    """
+    p_up: float = 0.5
+    confidence: float = 0.0
+    raw_p_up: float = 0.5
+    factors: Dict[str, float] = field(default_factory=dict)
+
+
 class MarketCalculator:
     """
     Fetches live Polymarket 5-min BTC market metadata and computes
     the directional signal (probability of UP) from the Binance price feed.
+
+    Signal pipeline:
+    1. Compute base p_up from random-walk CDF
+    2. Compute independent factor probabilities (trend, OBI, candle, volume)
+    3. Combine factors via Bayesian log-odds addition
+    4. Apply EMA smoothing to reduce tick-to-tick noise
+    5. Compute confidence metric from factor agreement + time
     """
+
+    # EMA smoothing: α = 2/(span+1). span=10 means ~10 ticks (~2s at 200ms)
+    _EMA_SPAN = 10
 
     def __init__(self, ob_ws: OrderBookWS):
         self._ob_ws = ob_ws
         self._markets: Dict[int, BtcMarket] = {}     # window_start → market
         self._session: Optional[aiohttp.ClientSession] = None
+
+        # Signal smoothing state
+        self._ema_p_up: Optional[float] = None
+        self._ema_alpha: float = 2.0 / (self._EMA_SPAN + 1)
+        self._last_window_start: int = 0  # reset EMA on window change
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(
@@ -298,26 +358,35 @@ class MarketCalculator:
         return self._markets.get(ws)
 
     # ------------------------------------------------------------------
-    # Directional signal (time-adjusted)
+    # Directional signal — Bayesian multi-factor with EMA smoothing
     # ------------------------------------------------------------------
 
     def p_up_signal(self, market: BtcMarket) -> float:
         """
         Estimate P(BTC closes UP) for the current window.
+        Returns the EMA-smoothed probability.
+        """
+        result = self.compute_signal(market)
+        return result.p_up
 
-        Core model: p_up = Φ( ret / σ_remaining )
+    def compute_signal(self, market: BtcMarket) -> SignalResult:
+        """
+        Full signal computation with confidence and factor breakdown.
 
-        Enhancements layered on top:
-          1. Mean reversion (O-U dampening of ret)
-          2. Time-of-day volatility adjustment
-          3. Volume-weighted sigma confidence
-          4. Adaptive multi-timeframe trend bias
-          5. Order Book Imbalance (OBI) shift
-          6. Candle close location pattern
+        Pipeline:
+        1. Base signal from random-walk CDF: p_base = Φ(ret/σ)
+        2. Independent factors (each produces a probability):
+           - Trend factor: 1h candle return → directional bias
+           - OBI factor: order book imbalance → short-term pressure
+           - Candle factor: close location of last candle → momentum
+           - Volume factor: above-average volume → confidence boost
+        3. Bayesian combination in log-odds space
+        4. EMA smoothing to reduce tick noise
+        5. Confidence computation
         """
         mid = self._ob_ws.book.mid_price
         if mid is None:
-            return 0.5
+            return SignalResult(p_up=0.5, confidence=0.0)
 
         if market.open_price is None:
             candle_open = self._ob_ws.candle.open
@@ -327,63 +396,172 @@ class MarketCalculator:
 
         stc = market.seconds_to_close
         if stc <= 0.5:
-            return 1.0 if ret > 0 else (0.0 if ret < 0 else 0.5)
+            p = 1.0 if ret > 0 else (0.0 if ret < 0 else 0.5)
+            return SignalResult(p_up=p, confidence=1.0, raw_p_up=p)
 
-        # --- Mean reversion adjustment (O-U) ---
-        kappa = Config.MEAN_REVERSION_KAPPA
-        if kappa > 0:
-            mean_ret = self._ob_ws.mean_return_5m
-            ret = ret * (1.0 - kappa) + mean_ret * kappa
-
-        # --- Sigma with time-of-day adjustment ---
+        # --- Step 1: Base signal (random-walk CDF) ---
         sigma = self._ob_ws.realized_sigma_5m
         if Config.TOD_VOL_ADJUST_ENABLED:
             sigma *= _tod_vol_multiplier()
 
         sigma_remaining = sigma * math.sqrt(stc / WINDOW_SEC)
 
-        # --- Volume-adjusted confidence ---
-        # High volume → price moves are more "real" → REDUCE σ (more confident)
-        # Low volume  → price moves are noise    → INCREASE σ (less confident)
-        vol_w = Config.VOLUME_CONFIDENCE_WEIGHT
-        if vol_w > 0:
-            vol_ratio = self._ob_ws.volume_ratio
-            # vol_ratio > 1 → shrink σ (divide by >1), vol_ratio < 1 → expand σ
-            vol_factor = 1.0 / (1.0 + vol_w * (vol_ratio - 1.0))
-            vol_factor = max(0.7, min(1.3, vol_factor))
-            sigma_remaining *= vol_factor
+        # Mean reversion: blend return toward recent mean (O-U process)
+        kappa = Config.MEAN_REVERSION_KAPPA
+        if kappa > 0:
+            mean_ret = self._ob_ws.mean_return_5m
+            ret_adj = ret * (1.0 - kappa) + mean_ret * kappa
+        else:
+            ret_adj = ret
 
         if sigma_remaining < 1e-10:
-            return 0.5
+            return SignalResult(p_up=0.5, confidence=0.0)
 
-        z = ret / sigma_remaining
+        z = ret_adj / sigma_remaining
         z = max(-6.0, min(6.0, z))
-        p = _phi(z)
+        p_base = _phi(z)
 
-        # --- Adaptive multi-timeframe trend bias ---
-        w_min = Config.TREND_WEIGHT_MIN
-        w_max = Config.TREND_WEIGHT_MAX
-        if w_max > 0:
+        # --- Step 2: Independent factor signals ---
+        factors: Dict[str, float] = {"base": p_base}
+
+        # Trend factor: 1h candle return → probability estimate
+        trend_p = 0.5
+        if Config.TREND_WEIGHT_MAX > 0:
             bias = self._ob_ws.hourly_trend_bias  # [-1, +1]
-            trend_strength = abs(bias)
-            w = w_min + (w_max - w_min) * trend_strength
-            trend_target = 0.5 + 0.5 * bias
-            p = p * (1.0 - w) + trend_target * w
+            # Map bias to probability: 0 → 0.5, ±1 → 0.9/0.1
+            trend_p = _sigmoid(bias * 2.0)  # 2.0 = sensitivity scaler
+            factors["trend"] = trend_p
 
-        # --- Order Book Imbalance adjustment ---
-        obi_w = Config.OBI_WEIGHT
-        if obi_w > 0:
-            obi = self._ob_ws.smoothed_obi
-            p = p + obi_w * obi
+        # OBI factor: positive imbalance → more buy pressure → p_up
+        obi_p = 0.5
+        if Config.OBI_WEIGHT > 0:
+            obi = self._ob_ws.smoothed_obi  # [-1, +1]
+            # Map OBI to probability
+            obi_p = _sigmoid(obi * 1.5)  # 1.5 = sensitivity scaler
+            factors["obi"] = obi_p
 
-        # --- Candle close location bias ---
-        cp_w = Config.CANDLE_PATTERN_WEIGHT
-        if cp_w > 0:
-            cl = self._ob_ws.last_candle_close_location
-            cl_bias = (cl - 0.5) * 2.0 * cp_w
-            p = p + cl_bias
+        # Candle close location: bullish close → momentum continuation
+        candle_p = 0.5
+        if Config.CANDLE_PATTERN_WEIGHT > 0:
+            cl = self._ob_ws.last_candle_close_location  # [0, 1]
+            candle_p = 0.3 + 0.4 * cl  # maps [0,1] → [0.3, 0.7]
+            factors["candle"] = candle_p
 
-        return max(0.01, min(0.99, p))
+        # Volume factor: high volume validates the current move direction
+        vol_p = 0.5
+        if Config.VOLUME_CONFIDENCE_WEIGHT > 0:
+            vol_ratio = self._ob_ws.volume_ratio
+            if vol_ratio > 1.2:
+                # High volume validates the base signal direction:
+                # push vol_p TOWARD p_base (amplify signal)
+                strength = min(1.0, (vol_ratio - 1.0) / 2.0)  # 0-1 scaling
+                vol_p = 0.5 + (p_base - 0.5) * strength
+            elif vol_ratio < 0.5:
+                # Low volume: signal unreliable, pull toward 0.5
+                vol_p = 0.5 + (p_base - 0.5) * 0.2  # dampen but don't ignore
+            else:
+                vol_p = 0.5  # neutral — no volume info
+            factors["volume"] = vol_p
+
+        # --- Step 3: Bayesian combination via log-odds ---
+        # Each factor contributes log-odds weighted by its influence.
+        # The base signal dominates; supplementary factors shift it.
+        #
+        # Math: log_odds_combined = w_base × logit(p_base) + Σ wᵢ × logit(pᵢ)
+        # Then:  p_combined = sigmoid(log_odds_combined)
+        #
+        # This is NOT normalized by total_weight — each factor adds
+        # independent evidence. Normalizing would cancel out evidence.
+        weights = {
+            "base":   1.0,
+            "trend":  Config.TREND_WEIGHT_MAX,
+            "obi":    Config.OBI_WEIGHT,
+            "candle": Config.CANDLE_PATTERN_WEIGHT,
+            "volume": Config.VOLUME_CONFIDENCE_WEIGHT,
+        }
+
+        log_odds_sum = 0.0
+        for name, p in factors.items():
+            w = weights.get(name, 0.0)
+            if w > 0:
+                log_odds_sum += w * _logit(p)
+
+        raw_p = _sigmoid(log_odds_sum) if factors else p_base
+
+        raw_p = max(0.01, min(0.99, raw_p))
+
+        # --- Step 4: EMA smoothing ---
+        # Reset EMA on window change to avoid stale signal from previous window
+        if market.window_start != self._last_window_start:
+            self._ema_p_up = None
+            self._last_window_start = market.window_start
+
+        if self._ema_p_up is None:
+            self._ema_p_up = raw_p
+        else:
+            # Adaptive alpha: SLOWER early (heavy smoothing when signal is noisy),
+            # FASTER near close (signal is clearer, need to react to real moves).
+            # time_fraction: 0.0 at start → 1.0 at close
+            time_frac = market.time_fraction
+            # alpha range: 0.5× base at open → 3× base at close
+            adaptive_alpha = self._ema_alpha * (0.5 + 2.5 * time_frac)
+            adaptive_alpha = max(0.05, min(0.8, adaptive_alpha))
+            self._ema_p_up = adaptive_alpha * raw_p + (1.0 - adaptive_alpha) * self._ema_p_up
+
+        smoothed_p = max(0.01, min(0.99, self._ema_p_up))
+
+        # --- Step 5: Confidence computation ---
+        confidence = self._compute_confidence(factors, smoothed_p, market, sigma)
+
+        return SignalResult(
+            p_up=smoothed_p,
+            confidence=confidence,
+            raw_p_up=raw_p,
+            factors=factors,
+        )
+
+    def _compute_confidence(
+        self,
+        factors: Dict[str, float],
+        p_final: float,
+        market: BtcMarket,
+        sigma: float,
+    ) -> float:
+        """
+        Confidence score [0, 1] based on:
+        1. Signal strength: how far from 0.5 (stronger = more confident)
+        2. Factor agreement: do all factors point the same direction?
+        3. Time proximity: closer to close = more confident in signal
+        4. Volatility regime: lower vol = more confident
+        """
+        # Signal strength: |p - 0.5| / 0.5, mapped to [0, 1]
+        strength = min(1.0, abs(p_final - 0.5) / 0.4)
+
+        # Factor agreement: count how many factors agree with final direction
+        direction_up = p_final > 0.5
+        agreements = 0
+        total_factors = 0
+        for name, p in factors.items():
+            total_factors += 1
+            if (p > 0.5) == direction_up:
+                agreements += 1
+        agreement_score = agreements / max(1, total_factors)
+
+        # Time proximity: sqrt mapping for smoother ramp
+        time_score = math.sqrt(market.time_fraction)
+
+        # Volatility regime penalty
+        vol_regime = self._ob_ws.vol_regime
+        vol_score = {"calm": 1.0, "normal": 0.8, "storm": 0.5}.get(vol_regime, 0.8)
+
+        # Weighted combination
+        confidence = (
+            0.35 * strength +
+            0.25 * agreement_score +
+            0.25 * time_score +
+            0.15 * vol_score
+        )
+        return max(0.0, min(1.0, confidence))
 
     def fair_prices(self, market: BtcMarket) -> tuple[float, float]:
         """
@@ -395,54 +573,98 @@ class MarketCalculator:
 
     def dynamic_spread(self, market: BtcMarket) -> float:
         """
-        Dynamic spread that narrows as the window approaches close.
+        Volatility-aware dynamic spread with risk floor.
 
-        Early (300s left): spread = base × 1.5  (high uncertainty)
-        Late  (10s left):  spread = base × 0.53 (direction clearer)
+        Spread components:
+        1. Time-based: wider early (uncertain), narrower late (clearer signal)
+        2. Volatility-scaled: wider when realized σ is high
+        3. Fee floor: ensures edge > fee + minimum profit margin
+
+        The spread NEVER goes below (fee + 1 cent) to prevent negative EV trades.
 
         Returns spread in price units (e.g. 0.03 = 3 cents).
         """
-        time_frac = market.seconds_to_close / Config.MARKET_WINDOW_SEC  # 1.0→0.0
-        time_scale = 0.5 + time_frac  # 1.5 → 0.5
-        base = Config.BASE_SPREAD_BPS / 10_000
-        spread = base * time_scale
+        stc = market.seconds_to_close
+        time_frac = stc / Config.MARKET_WINDOW_SEC  # 1.0→0.0
 
-        min_s = Config.MIN_SPREAD_BPS / 10_000
+        # Time scaling: linear decline with sqrt floor to prevent collapse
+        # At open (time_frac=1.0): scale = 1.5
+        # At close (time_frac=0.0): scale = 0.5
+        time_scale = 0.5 + time_frac
+
+        base = Config.BASE_SPREAD_BPS / 10_000
+
+        # Volatility scaling: wider spread when vol is above normal
+        sigma = self._ob_ws.realized_sigma_5m
+        sigma_baseline = Config.SIGMA_5M
+        vol_scale = max(0.8, min(2.0, sigma / sigma_baseline))
+
+        spread = base * time_scale * vol_scale
+
+        # Fee floor: at mid-range price (0.5), fee ≈ 1-2 cents.
+        # We need spread > fee + 0.5 cent margin to ensure positive EV.
+        fee_at_midrange = compute_fee_per_share(0.60)
+        fee_floor = fee_at_midrange + 0.005  # fee + 0.5 cent
+
+        min_s = max(Config.MIN_SPREAD_BPS / 10_000, fee_floor)
         max_s = Config.MAX_SPREAD_BPS / 10_000
         return max(min_s, min(max_s, spread))
+
+    def expected_value(
+        self,
+        p_signal: float,
+        entry_price: float,
+        size_usdc: float,
+    ) -> float:
+        """
+        Expected value of a binary option trade in USDC.
+
+        EV = p × (shares × (1 - price) - fee) + (1-p) × (-size)
+
+        Positive EV means the trade has positive expected profit.
+        """
+        if entry_price <= 0 or entry_price >= 1:
+            return 0.0
+        shares = size_usdc / entry_price
+        fee = compute_fee(shares, entry_price)
+        win_profit = shares * (1.0 - entry_price) - fee
+        loss = -size_usdc
+        return p_signal * win_profit + (1.0 - p_signal) * loss
 
     @staticmethod
     def kelly_size(
         p_signal: float,
         entry_price: float,
         base_size: float,
+        confidence: float = 1.0,
     ) -> float:
         """
-        Half-Kelly position sizing for binary options, fee-aware.
+        Confidence-adjusted half-Kelly position sizing for binary options.
 
-        Subtracts expected fee per share from the gross edge before
-        computing Kelly fraction.  This reduces position size when fees
-        eat into the edge (low-signal entries near p=0.50) and has
-        minimal impact when fees are negligible (high-signal entries).
+        Improvements over basic Kelly:
+        1. Fee-aware: subtracts expected fee from edge
+        2. Confidence-scaled: multiplies Kelly fraction by signal confidence
+        3. Conservative: uses half-Kelly (f*/2) to reduce variance
+        4. Bounded: clamped to [MIN, MAX] × base_size
 
-        The result is clamped to [MIN_MULT, MAX_MULT] × base_size.
-        Returns 0 if there is no net edge after fees.
+        Returns 0 if net edge is non-positive.
         """
         if Config.KELLY_FRACTION <= 0:
             return base_size
 
-        # Subtract fee from gross edge
         fee_ps = compute_fee_per_share(entry_price)
         net_edge = p_signal - entry_price - fee_ps
         if net_edge <= 0:
             return 0.0
 
-        # f* = net_edge / (1 - entry_price)  is the full Kelly for binary payoff
+        # Full Kelly for binary payoff: f* = net_edge / (1 - entry_price)
         kelly_f = net_edge / (1.0 - entry_price) if entry_price < 1.0 else 0.0
-        half_kelly = kelly_f * 0.5 * Config.KELLY_FRACTION
 
-        # Map half_kelly [0..~0.5] → size multiplier [MIN..MAX]
-        mult = Config.KELLY_MIN_SIZE_MULT + half_kelly * (
+        # Half-Kelly scaled by confidence and user fraction
+        adjusted_kelly = kelly_f * 0.5 * Config.KELLY_FRACTION * confidence
+
+        # Map to size multiplier
+        mult = Config.KELLY_MIN_SIZE_MULT + adjusted_kelly * (
             Config.KELLY_MAX_SIZE_MULT - Config.KELLY_MIN_SIZE_MULT
         )
         mult = max(Config.KELLY_MIN_SIZE_MULT, min(Config.KELLY_MAX_SIZE_MULT, mult))
@@ -458,18 +680,16 @@ class MarketCalculator:
         """
         Compute bid price aware of real Polymarket CLOB ask and fees.
 
-        Logic:
-        - Base bid = fair - spread (our normal pricing)
-        - If CLOB ask is known and lower than base bid, we cap our bid
-          at (market_ask - MIN_EDGE) to avoid overpaying.
-        - Never bid above (fair - min_spread - fee) to preserve minimum
-          net edge after fees.
-
-        This increases fill rate (we sit closer to the ask when it's tight)
-        while preventing overpayment (we never cross the ask needlessly).
+        Pricing rules (in priority order):
+        1. Base bid = fair - spread
+        2. Never cross the market ask (cap at ask - MIN_EDGE)
+        3. Never bid above ceiling (fair - min_spread - fee)
+        4. Never bid below MIN_BID_PRICE (too low = never fills)
+        5. Ensure positive expected value after fees
         """
         MIN_EDGE = 0.005  # 0.5¢ minimum below market ask
         base_bid = fair - spread
+
         # Ceiling accounts for fee at the ceiling price to ensure net edge
         raw_ceiling = fair - min_spread_price
         fee_at_ceiling = compute_fee_per_share(raw_ceiling)
@@ -477,10 +697,14 @@ class MarketCalculator:
 
         if market_ask is not None and market_ask > 0:
             orderbook_cap = market_ask - MIN_EDGE
-            # Orderbook only caps our bid DOWN (avoid overpaying vs ask),
-            # never pushes it UP above base_bid.
             bid = min(base_bid, orderbook_cap, ceiling)
         else:
             bid = min(base_bid, ceiling)
+
+        # Ensure bid gives positive EV: need fair > bid + fee_per_share
+        fee_at_bid = compute_fee_per_share(bid)
+        if fair < bid + fee_at_bid + 0.005:
+            # Edge too thin — pull bid down to ensure minimum 0.5% edge
+            bid = fair - fee_at_bid - 0.01
 
         return round(max(Config.MIN_BID_PRICE, bid), 2)

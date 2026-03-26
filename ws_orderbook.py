@@ -1,21 +1,28 @@
 """
-Binance WebSocket order book client.
+Binance WebSocket order book client with advanced market microstructure.
 
 Subscribes to three combined streams:
   - <symbol>@depth20@100ms   →  live 20-level order book (refreshed every 100 ms)
   - <symbol>@kline_5m        →  5-minute candles for volatility + window open price
   - <symbol>@kline_1h        →  1-hour candles for higher-timeframe trend bias
 
+Market microstructure features
+------------------------------
+- VWAP tracking: volume-weighted average price for more robust return estimation
+- Multi-level OBI: weighted imbalance across all 20 orderbook levels (not just top 5)
+- Tick direction tracking: tracks uptick/downtick sequences for momentum detection
+- Trade flow imbalance: approximates buy/sell aggressor ratio from tick direction
+
 Adaptive volatility
 -------------------
 Tracks returns of the last N closed 5-minute candles to compute realized σ.
-This replaces the static Config.SIGMA_5M when enough data is available.
+Uses exponential weighting with configurable half-life so recent candles
+contribute more. Bessel-corrected for unbiased variance estimation.
 
-Multi-timeframe trend
----------------------
-The hourly candle return (close - open) / open provides a trend bias that the
-signal model can blend with the 5-minute signal to reduce adverse selection
-during strong trends.
+Volatility regime detection
+----------------------------
+Classifies current vol into 'calm', 'normal', or 'storm' based on percentile
+rank vs recent history. Storm mode widens spreads and reduces size.
 """
 import asyncio
 import json
@@ -38,8 +45,8 @@ Qty = float
 
 @dataclass
 class OrderBook:
-    """Live best bid/ask and top N levels."""
-    bids: List[Tuple[Price, Qty]] = field(default_factory=list)  # [(price, qty), ...]
+    """Live best bid/ask and top N levels with microstructure metrics."""
+    bids: List[Tuple[Price, Qty]] = field(default_factory=list)
     asks: List[Tuple[Price, Qty]] = field(default_factory=list)
     last_update_ms: int = 0
 
@@ -56,6 +63,23 @@ class OrderBook:
         if self.best_bid and self.best_ask:
             return (self.best_bid + self.best_ask) / 2
         return None
+
+    @property
+    def micro_price(self) -> Optional[Price]:
+        """
+        Micro-price: volume-weighted mid price.
+        More accurate fair value estimate than simple mid.
+        micro_price = (ask_qty × bid + bid_qty × ask) / (bid_qty + ask_qty)
+        When ask_qty >> bid_qty, micro_price is pulled toward the ask (upward pressure).
+        """
+        if not self.bids or not self.asks:
+            return self.mid_price
+        bid_p, bid_q = self.bids[0]
+        ask_p, ask_q = self.asks[0]
+        total_q = bid_q + ask_q
+        if total_q < 1e-10:
+            return self.mid_price
+        return (ask_q * bid_p + bid_q * ask_p) / total_q
 
     @property
     def spread_bps(self) -> Optional[float]:
@@ -76,10 +100,46 @@ class OrderBook:
             return 0.0
         return (bid_vol - ask_vol) / total
 
+    @property
+    def weighted_imbalance(self) -> float:
+        """
+        Depth-weighted OBI across all available levels.
+        Closer levels get exponentially higher weight (decay factor = 0.7).
+        More informative than flat top-5 imbalance for detecting real pressure.
+        """
+        if not self.bids or not self.asks:
+            return 0.0
+        decay = 0.7
+        bid_weighted = 0.0
+        ask_weighted = 0.0
+        n_levels = min(len(self.bids), len(self.asks), 20)
+        for i in range(n_levels):
+            w = decay ** i
+            bid_weighted += w * self.bids[i][1]
+            ask_weighted += w * self.asks[i][1]
+        total = bid_weighted + ask_weighted
+        if total < 1e-10:
+            return 0.0
+        return (bid_weighted - ask_weighted) / total
+
+    @property
+    def depth_ratio(self) -> float:
+        """
+        Total bid depth / total ask depth across all levels.
+        > 1.0 = buy wall dominance, < 1.0 = sell wall dominance.
+        """
+        if not self.bids or not self.asks:
+            return 1.0
+        bid_total = sum(q for _, q in self.bids)
+        ask_total = sum(q for _, q in self.asks)
+        if ask_total < 1e-10:
+            return 1.0
+        return bid_total / ask_total
+
 
 @dataclass
 class Candle5m:
-    """Most recent closed 5-minute candle."""
+    """Most recent 5-minute candle (may be open or closed)."""
     open: float = 0.0
     high: float = 0.0
     low: float = 0.0
@@ -104,6 +164,20 @@ class Candle5m:
         if hl_range < 1e-10:
             return 0.5
         return (self.close - self.low) / hl_range
+
+    @property
+    def body_ratio(self) -> float:
+        """
+        Candle body size / range. High = strong directional candle, low = doji/indecision.
+        """
+        hl_range = self.high - self.low
+        if hl_range < 1e-10:
+            return 0.0
+        return abs(self.close - self.open) / hl_range
+
+    @property
+    def is_bullish(self) -> bool:
+        return self.close > self.open
 
 
 @dataclass
@@ -130,39 +204,52 @@ class OrderBookWS:
       - <symbol>@kline_5m       →  5m candles for volatility
       - <symbol>@kline_1h       →  1h candles for trend bias
 
-    Usage:
-        ob = OrderBookWS()
-        asyncio.create_task(ob.run())
-        # then read ob.book, ob.candle, ob.candle_1h freely
+    Exposes derived microstructure properties:
+      - realized_sigma_5m: adaptive volatility from recent candles
+      - smoothed_obi: EMA of order book imbalance
+      - weighted_obi: depth-weighted OBI (more informative)
+      - volume_ratio: current vs median candle volume
+      - tick_momentum: recent uptick/downtick ratio
+      - vwap_5m: VWAP of current 5-minute period
     """
 
-    # Minimum closed candles needed before we trust realized vol
     _MIN_CANDLES_FOR_SIGMA = 6
-    # Exponential weight half-life in candle units (12 candles = 1 hour)
-    _SIGMA_HALF_LIFE = 12.0
+    _SIGMA_HALF_LIFE = 12.0  # candle units (~1 hour)
 
     def __init__(self):
         self.book = OrderBook()
         self.candle = Candle5m()
         self.candle_1h = Candle1h()
         self._running = False
-        self._reconnect_delay = 1.0  # seconds, doubles on each failure
-        self._last_disconnect: float = 0.0  # monotonic time of last disconnect
+        self._reconnect_delay = 1.0
+        self._last_disconnect: float = 0.0
+
         # Realized vol: returns of last 48 closed 5m candles (~4 hours)
         self._closed_returns: Deque[float] = deque(maxlen=48)
-        # Volume tracking for volume signal
         self._closed_volumes: Deque[float] = deque(maxlen=48)
-        # OBI smoothing: EMA of recent order book imbalance values
-        self._obi_history: Deque[float] = deque(maxlen=50)  # ~5s at 100ms
-        # Last fully closed 5m candle (for candle close location pattern)
+
+        # OBI smoothing: EMA of recent imbalance values
+        self._obi_history: Deque[float] = deque(maxlen=50)
+        # Weighted OBI history (separate from simple OBI)
+        self._wobi_history: Deque[float] = deque(maxlen=50)
+
+        # Last fully closed 5m candle
         self._last_closed_candle: Optional[Candle5m] = None
+
+        # Tick direction tracking
+        self._last_mid: Optional[float] = None
+        self._tick_directions: Deque[int] = deque(maxlen=100)  # +1 uptick, -1 downtick
+
+        # VWAP tracking within current 5m window
+        self._vwap_price_volume: float = 0.0  # Σ(price × volume)
+        self._vwap_volume: float = 0.0         # Σ(volume)
+
+        # Consecutive candle direction tracking
+        self._candle_directions: Deque[int] = deque(maxlen=12)  # +1 bullish, -1 bearish
 
     def _stream_url(self) -> str:
         symbol = Config.BTC_SYMBOL.lower()
         streams = f"{symbol}@depth20@100ms/{symbol}@kline_5m/{symbol}@kline_1h"
-        # Combined streams require /stream?streams= endpoint (not /ws/<path>).
-        # Single-stream /ws/ endpoint does not wrap messages in
-        # {"stream": ..., "data": ...}, so _handle() would never match depth/kline.
         base = Config.BINANCE_WS_URL.removesuffix("/ws")
         return f"{base}/stream?streams={streams}"
 
@@ -172,15 +259,13 @@ class OrderBookWS:
         while self._running:
             try:
                 await self._connect()
-                self._reconnect_delay = 1.0  # reset on clean connect
+                self._reconnect_delay = 1.0
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-                # If enough time passed since last disconnect (>60s of stable
-                # connection), reset backoff so a fresh failure starts at 1s.
                 now = time.monotonic()
                 if now - self._last_disconnect > 60.0:
                     self._reconnect_delay = 1.0
                 self._last_disconnect = now
-                log.warning("WS disconnected: %s – reconnecting in %.1fs", exc, self._reconnect_delay)
+                log.warning("WS disconnected: %s \u2013 reconnecting in %.1fs", exc, self._reconnect_delay)
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
             except asyncio.CancelledError:
@@ -201,7 +286,7 @@ class OrderBookWS:
             return
 
         stream = msg.get("stream", "")
-        data = msg.get("data", msg)  # combined streams wrap in {"stream":..,"data":..}
+        data = msg.get("data", msg)
 
         if "depth" in stream:
             self._update_book(data)
@@ -214,8 +299,30 @@ class OrderBookWS:
         self.book.bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
         self.book.asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
         self.book.last_update_ms = int(time.time() * 1000)
+
         # Track OBI for smoothed signal
         self._obi_history.append(self.book.imbalance)
+        self._wobi_history.append(self.book.weighted_imbalance)
+
+        # Track tick direction for momentum
+        mid = self.book.mid_price
+        if mid is not None and self._last_mid is not None:
+            diff = mid - self._last_mid
+            # Threshold: 0.01% of price (≈$8.7 at $87k BTC) — filters out
+            # sub-cent noise while catching real orderbook-level moves.
+            threshold = self._last_mid * 0.0001
+            if abs(diff) > threshold:
+                self._tick_directions.append(1 if diff > 0 else -1)
+        self._last_mid = mid
+
+        # VWAP accumulation: weight by top-of-book volume (actual liquidity)
+        if mid is not None:
+            # Use total top-5 bid+ask volume as weight — real proxy for activity
+            bid_vol = sum(q for _, q in self.book.bids[:5]) if self.book.bids else 0.0
+            ask_vol = sum(q for _, q in self.book.asks[:5]) if self.book.asks else 0.0
+            weight = max(0.001, bid_vol + ask_vol)
+            self._vwap_price_volume += mid * weight
+            self._vwap_volume += weight
 
     def _update_candle(self, data: dict) -> None:
         k = data.get("k", {})
@@ -236,6 +343,11 @@ class OrderBookWS:
             self._closed_returns.append((c - o) / o)
             self._closed_volumes.append(float(k.get("v", 0)))
             self._last_closed_candle = self.candle
+            self._candle_directions.append(1 if c > o else -1)
+
+            # Reset VWAP for next window
+            self._vwap_price_volume = 0.0
+            self._vwap_volume = 0.0
 
     def _update_candle_1h(self, data: dict) -> None:
         k = data.get("k", {})
@@ -247,19 +359,19 @@ class OrderBookWS:
             is_closed=bool(k.get("x", False)),
         )
 
+    # ------------------------------------------------------------------
+    # Derived properties
+    # ------------------------------------------------------------------
+
     @property
     def hourly_trend_bias(self) -> float:
         """
         Trend bias from 1h candle return, clamped to [-1, +1].
-
         Positive = bullish (favour YES), negative = bearish (favour NO).
-        Maps hourly return through a sensitivity scaler so that a 0.3% move
-        gives ≈0.3 bias and a 1%+ move saturates at ±1.
         """
         ret = self.candle_1h.ret
         if abs(ret) < 1e-8:
             return 0.0
-        # Scale: 1% hourly move → bias of 1.0
         bias = ret / Config.TREND_SENSITIVITY
         return max(-1.0, min(1.0, bias))
 
@@ -268,26 +380,24 @@ class OrderBookWS:
         """
         Realized 5-minute return volatility from recent closed candles.
 
-        Uses exponential weighting (half-life = 12 candles ≈ 1 hour) so
-        recent candles contribute more.  Bessel-corrected for weighted
-        sample variance.
-
-        Falls back to Config.SIGMA_5M when not enough data yet.
+        Uses exponential weighting (half-life = 12 candles ~ 1 hour).
+        Bessel-corrected for weighted sample variance.
         Clamped to [0.0005, 0.006] to prevent extremes.
+        Falls back to Config.SIGMA_5M when insufficient data.
         """
         if len(self._closed_returns) < self._MIN_CANDLES_FOR_SIGMA:
             return Config.SIGMA_5M
         returns = list(self._closed_returns)
         n = len(returns)
 
-        # Exponential weights: half-life = _SIGMA_HALF_LIFE candles
+        # Exponential weights
         weights = [2.0 ** ((i - n + 1) / self._SIGMA_HALF_LIFE) for i in range(n)]
         total_w = sum(weights)
 
         # Weighted mean
         mean = sum(w * r for w, r in zip(weights, returns)) / total_w
 
-        # Weighted sample variance (Bessel correction: divide by total_w - w_max)
+        # Weighted variance with Bessel correction
         var = sum(w * (r - mean) ** 2 for w, r in zip(weights, returns)) / (total_w - weights[-1])
         return max(0.0005, min(0.006, math.sqrt(var)))
 
@@ -305,11 +415,53 @@ class OrderBookWS:
         return ema
 
     @property
+    def weighted_obi(self) -> float:
+        """EMA of depth-weighted OBI (more informative than simple OBI)."""
+        if not self._wobi_history:
+            return 0.0
+        values = list(self._wobi_history)
+        n = len(values)
+        alpha = 2.0 / (n + 1)
+        ema = values[0]
+        for v in values[1:]:
+            ema = alpha * v + (1 - alpha) * ema
+        return ema
+
+    @property
+    def tick_momentum(self) -> float:
+        """
+        Tick momentum: ratio of upticks to total ticks over recent history.
+        Returns [-1, +1]. Positive = upward momentum.
+        """
+        if len(self._tick_directions) < 10:
+            return 0.0
+        ticks = list(self._tick_directions)
+        ups = sum(1 for t in ticks if t > 0)
+        return (2.0 * ups / len(ticks)) - 1.0
+
+    @property
+    def vwap_5m(self) -> Optional[float]:
+        """VWAP for the current 5-minute window."""
+        if self._vwap_volume < 1e-10:
+            return self.book.mid_price
+        return self._vwap_price_volume / self._vwap_volume
+
+    @property
+    def candle_trend_strength(self) -> float:
+        """
+        Consecutive candle direction strength.
+        Returns [-1, +1]. +1 = all recent candles bullish, -1 = all bearish.
+        """
+        if len(self._candle_directions) < 3:
+            return 0.0
+        recent = list(self._candle_directions)[-6:]
+        return sum(recent) / len(recent)
+
+    @property
     def volume_ratio(self) -> float:
         """
         Current candle volume / median of recent closed candle volumes.
-        > 1.0 = above-average volume (stronger signal).
-        < 1.0 = below-average volume (weaker signal).
+        > 1.0 = above-average volume. < 1.0 = below-average volume.
         """
         if len(self._closed_volumes) < 3 or self.candle.volume <= 0:
             return 1.0

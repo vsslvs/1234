@@ -21,6 +21,8 @@ class TradeSnapshot:
     p_signal: float
     won: bool
     pnl: float
+    confidence: float = 0.0
+    exit_type: str = "binary"
 
 
 @dataclass
@@ -40,18 +42,24 @@ class BotState:
     fair_no: float = 0.5
     candle_vol_bps: float = 0.0
 
+    # Signal quality
+    signal_confidence: float = 0.0
+    signal_raw_p_up: float = 0.5
+    signal_factors: Dict[str, float] = field(default_factory=dict)
+
     # Current window
     window_start: int = 0
     window_end: int = 0
     seconds_to_close: float = 0.0
-    phase: str = "initializing"  # "quoting", "exit", "vol_skip"
-    spread: float = 0.0          # current dynamic spread in price units
-    realized_sigma: float = 0.0  # adaptive 5m vol from closed candles
-    hourly_trend_bias: float = 0.0  # 1h trend bias [-1, +1]
-    obi: float = 0.0                    # smoothed order book imbalance
-    vol_regime: str = "normal"           # calm / normal / storm
-    volume_ratio: float = 1.0           # current vs median volume
-    hedge_timeout_active: bool = False   # True when hedge rush mode is engaged
+    phase: str = "initializing"
+    spread: float = 0.0
+    realized_sigma: float = 0.0
+    hourly_trend_bias: float = 0.0
+    obi: float = 0.0
+    vol_regime: str = "normal"
+    volume_ratio: float = 1.0
+    hedge_timeout_active: bool = False
+    tick_momentum: float = 0.0
 
     # Orders
     yes_order_active: bool = False
@@ -59,7 +67,11 @@ class BotState:
     yes_order_price: float = 0.0
     no_order_price: float = 0.0
 
-    # Polymarket market prices (best ask from CLOB orderbook)
+    # Expected value of current quotes
+    yes_ev: float = 0.0
+    no_ev: float = 0.0
+
+    # Polymarket market prices
     market_yes_ask: Optional[float] = None
     market_no_ask: Optional[float] = None
 
@@ -72,7 +84,15 @@ class BotState:
     win_rate: float = 0.0
     rolling_win_rate: float = 0.0
 
-    # Recent trades (last 20)
+    # Advanced stats
+    sharpe_ratio: Optional[float] = None
+    max_drawdown: float = 0.0
+    profit_factor: Optional[float] = None
+    consecutive_losses: int = 0
+    max_win_streak: int = 0
+    max_loss_streak: int = 0
+
+    # Recent trades (last 50)
     recent_trades: List[TradeSnapshot] = field(default_factory=list)
 
     # Timestamp of last update
@@ -92,6 +112,9 @@ class BotState:
             "fair_yes": round(self.fair_yes, 4),
             "fair_no": round(self.fair_no, 4),
             "candle_vol_bps": round(self.candle_vol_bps, 1),
+            "signal_confidence": round(self.signal_confidence, 3),
+            "signal_raw_p_up": round(self.signal_raw_p_up, 4),
+            "signal_factors": {k: round(v, 4) for k, v in self.signal_factors.items()},
             "window_start": self.window_start,
             "window_end": self.window_end,
             "seconds_to_close": round(self.seconds_to_close, 1),
@@ -103,10 +126,13 @@ class BotState:
             "vol_regime": self.vol_regime,
             "volume_ratio": round(self.volume_ratio, 2),
             "hedge_timeout_active": self.hedge_timeout_active,
+            "tick_momentum": round(self.tick_momentum, 3),
             "yes_order_active": self.yes_order_active,
             "no_order_active": self.no_order_active,
             "yes_order_price": round(self.yes_order_price, 4),
             "no_order_price": round(self.no_order_price, 4),
+            "yes_ev": round(self.yes_ev, 3),
+            "no_ev": round(self.no_ev, 3),
             "market_yes_ask": round(self.market_yes_ask, 4) if self.market_yes_ask is not None else None,
             "market_no_ask": round(self.market_no_ask, 4) if self.market_no_ask is not None else None,
             "total_trades": self.total_trades,
@@ -116,14 +142,22 @@ class BotState:
             "total_pnl": round(self.total_pnl, 2),
             "win_rate": round(self.win_rate * 100, 1),
             "rolling_win_rate": round(self.rolling_win_rate * 100, 1),
+            "sharpe_ratio": round(self.sharpe_ratio, 2) if self.sharpe_ratio is not None else None,
+            "max_drawdown": round(self.max_drawdown, 2),
+            "profit_factor": round(self.profit_factor, 2) if self.profit_factor is not None else None,
+            "consecutive_losses": self.consecutive_losses,
+            "max_win_streak": self.max_win_streak,
+            "max_loss_streak": self.max_loss_streak,
             "recent_trades": [
                 {
                     "time": t.timestamp,
                     "side": t.side,
                     "price": t.entry_price,
                     "signal": round(t.p_signal * 100, 1),
+                    "confidence": round(t.confidence, 2),
                     "result": "WIN" if t.won else "LOSS",
                     "pnl": round(t.pnl, 2),
+                    "exit_type": t.exit_type,
                 }
                 for t in self.recent_trades[-20:]
             ],
