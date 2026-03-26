@@ -482,4 +482,4 @@ class MarketCalculator:
         else:
             bid = base_bid
 
-        return round(max(0.01, bid), 2)
+        return round(max(Config.MIN_BID_PRICE, bid), 2)

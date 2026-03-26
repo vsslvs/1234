@@ -510,11 +510,22 @@ class MarketMaker:
                 candle_vol, stc, vol_regime, skew_label,
             )
 
+        # --- Signal direction filter ---
+        # Don't place orders on the side the signal says will lose.
+        # When p_up > 0.5: YES is favoured, skip NO unless close to 50/50.
+        # When p_up < 0.5: NO is favoured, skip YES unless close to 50/50.
+        # Both sides only when signal is within ±HEDGE_BAND of 0.5.
+        HEDGE_BAND = 0.10  # place both when p_up in [0.40, 0.60]
+        place_yes = p_up >= (0.5 - HEDGE_BAND)  # skip YES only when p_up < 0.40
+        place_no  = p_up <= (0.5 + HEDGE_BAND)  # skip NO  only when p_up > 0.60
+
+        min_bid = Config.MIN_BID_PRICE  # default 0.05 — bids below this never fill
+
         # --- Place/refresh orders on both sides ---
         tasks = []
 
         # YES side
-        if yes_bid >= 0.01 and yes_size > 0:
+        if place_yes and yes_bid >= min_bid and yes_size > 0:
             if not state.yes.was_ever_active:
                 state.yes.p_signal_at_entry = p_up
                 state.yes.was_ever_active = True
@@ -524,9 +535,12 @@ class MarketMaker:
             state.yes.last_entry_price = yes_bid
             state.yes.last_entry_size = yes_size
             tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
+        elif state.yes.has_order and not place_yes:
+            # Cancel the wrong-side order if it was placed before signal shifted
+            tasks.append(self._cancel_side(state.yes))
 
         # NO side
-        if no_bid >= 0.01 and no_size > 0:
+        if place_no and no_bid >= min_bid and no_size > 0:
             if not state.no.was_ever_active:
                 state.no.p_signal_at_entry = p_up
                 state.no.was_ever_active = True
@@ -536,6 +550,8 @@ class MarketMaker:
             state.no.last_entry_price = no_bid
             state.no.last_entry_size = no_size
             tasks.append(self._refresh_side(state.no, no_bid, no_size))
+        elif state.no.has_order and not place_no:
+            tasks.append(self._cancel_side(state.no))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

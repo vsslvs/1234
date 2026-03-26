@@ -33,6 +33,8 @@ class Config:
 
     # Pricing
     MAX_ENTRY_PRICE: float = _get("MAX_ENTRY_PRICE", "0.95", float)
+    # Minimum bid price — don't place orders below this (they never fill in live)
+    MIN_BID_PRICE: float = _get("MIN_BID_PRICE", "0.05", float)
 
     # Two-sided spread parameters (basis points)
     # We BUY at (fair - spread) on both YES and NO.
