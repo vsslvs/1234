@@ -40,6 +40,7 @@ from config import Config
 from market_calculator import BtcMarket, MarketCalculator, compute_fee_per_share, compute_fee
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
 from stats import BotStats
+from trade_logger import TradeLogger, TradeRow
 from ws_orderbook import OrderBookWS
 
 log = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ class MarketMaker:
         self._state:  Optional[WindowState] = None
         self._running = False
         self._stats   = BotStats()
+        self._logger  = TradeLogger()
         self._windows_since_stats_log = 0
         self._last_status_log: float = 0.0
         self._last_quote_log: float = 0.0
@@ -180,6 +182,25 @@ class MarketMaker:
         self._running = False
         self._stats.log_summary()
         await self._cancel_all_open()
+
+        # Write session summary CSV
+        from collections import Counter
+        window_sides: Counter = Counter()
+        for t in self._stats._trades:
+            window_sides[t.window_start] += 1
+        two_sided = sum(1 for c in window_sides.values() if c >= 2)
+        balance = self._client.balance if hasattr(self._client, 'balance') else 0.0
+        self._logger.log_session_summary(
+            total_trades=self._stats.total_trades,
+            wins=self._stats._wins,
+            losses=self._stats._losses,
+            stop_losses=dashboard_state.stop_losses,
+            total_pnl=self._stats.total_pnl,
+            total_fees=self._stats._total_fees,
+            final_balance=balance,
+            avg_entry_price=self._stats.avg_entry_price or 0.0,
+            two_sided_fills=two_sided,
+        )
 
     # ------------------------------------------------------------------
     # Per-tick logic
@@ -678,6 +699,32 @@ class MarketMaker:
         if len(dashboard_state.recent_trades) > 50:
             dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
 
+        # CSV log
+        balance = self._client.balance if hasattr(self._client, 'balance') else 0.0
+        self._logger.log_trade(TradeRow(
+            window_start=state.market.window_start,
+            window_end=state.market.window_end,
+            side=side.side_label,
+            entry_price=entry_price,
+            size_usdc=size_usdc,
+            p_signal=side.p_signal_at_entry,
+            sigma=self._ob_ws.realized_sigma_5m,
+            vol_regime=self._ob_ws.vol_regime,
+            obi=self._ob_ws.smoothed_obi,
+            volume_ratio=self._ob_ws.volume_ratio,
+            spread=self._calc.dynamic_spread(state.market),
+            btc_open=state.market.open_price or 0.0,
+            btc_close=self._ob_ws.book.mid_price or 0.0,
+            market_ask=self._last_yes_ask if side.side_label == "YES" else self._last_no_ask or 0.0,
+            market_bid=self._last_yes_bid if side.side_label == "YES" else self._last_no_bid or 0.0,
+            outcome="STOP-LOSS",
+            pnl=pnl,
+            fee=0.0,
+            balance_after=balance,
+            exit_type="stop-loss",
+            stc_at_fill=Config.MARKET_WINDOW_SEC - (side.first_fill_time - state.market.window_start) if side.first_fill_time > 0 else 0.0,
+        ))
+
         # Mark as stopped out to prevent double evaluation at rollover
         side.stopped_out = True
         side.stop_loss_pnl = pnl
@@ -775,6 +822,36 @@ class MarketMaker:
                 self._client.resolve_trade(won, size_usdc, entry_price)
 
             pnl = shares * (1.0 - entry_price) - fee if won else -size_usdc
+
+            # CSV log
+            balance = self._client.balance if hasattr(self._client, 'balance') else 0.0
+            opp_side = state.no if side.side_label == "YES" else state.yes
+            self._logger.log_trade(TradeRow(
+                window_start=market.window_start,
+                window_end=market.window_end,
+                side=side.side_label,
+                entry_price=entry_price,
+                size_usdc=size_usdc,
+                p_signal=side.p_signal_at_entry,
+                sigma=self._ob_ws.realized_sigma_5m,
+                vol_regime=self._ob_ws.vol_regime,
+                obi=round(self._ob_ws.smoothed_obi, 4),
+                volume_ratio=round(self._ob_ws.volume_ratio, 2),
+                spread=round(self._calc.dynamic_spread(market), 4),
+                btc_open=market.open_price or 0.0,
+                btc_close=mid,
+                market_ask=(self._last_yes_ask or 0.0) if side.side_label == "YES" else (self._last_no_ask or 0.0),
+                market_bid=(self._last_yes_bid or 0.0) if side.side_label == "YES" else (self._last_no_bid or 0.0),
+                outcome="WIN" if won else "LOSS",
+                pnl=round(pnl, 4),
+                fee=round(fee, 4),
+                balance_after=round(balance, 2),
+                exit_type="binary",
+                hedge_filled=opp_side.was_ever_filled,
+                hedge_side=opp_side.side_label if opp_side.was_ever_filled else "",
+                hedge_price=opp_side.last_entry_price if opp_side.was_ever_filled else 0.0,
+            ))
+
             dashboard_state.recent_trades.append(TradeSnapshot(
                 timestamp=time.time(),
                 window_start=market.window_start,
