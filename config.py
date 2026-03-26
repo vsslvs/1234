@@ -155,7 +155,7 @@ class Config:
     # threshold = (base + vol_scale × σ/0.002) × max(0.3, stc/120)
     STOP_LOSS_ENABLED: bool = _get("STOP_LOSS_ENABLED", "true", lambda v: v.lower() in ("true", "1", "yes"))
     STOP_LOSS_THRESHOLD: float = _get("STOP_LOSS_THRESHOLD", "0.12", float)  # fallback
-    STOP_LOSS_BASE: float = _get("STOP_LOSS_BASE", "0.06", float)
+    STOP_LOSS_BASE: float = _get("STOP_LOSS_BASE", "0.12", float)
     STOP_LOSS_VOL_SCALE: float = _get("STOP_LOSS_VOL_SCALE", "0.04", float)
     STOP_LOSS_MIN_STC: float = _get("STOP_LOSS_MIN_STC", "15", float)
 

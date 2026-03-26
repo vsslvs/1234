@@ -45,9 +45,9 @@ from ws_orderbook import OrderBookWS
 log = logging.getLogger(__name__)
 
 # Minimum price change to trigger a cancel/replace.
-# 1 cent — reduces churn vs the old 0.5-cent threshold while still
-# tracking fair-price moves that matter for our 1.5-4.5 cent spread.
-PRICE_DRIFT_THRESHOLD = 0.01
+# 2 cents — reduces churn from constant BTC oscillations while still
+# tracking meaningful fair-price moves within our 1.5-4.5 cent spread.
+PRICE_DRIFT_THRESHOLD = 0.02
 
 
 class MarketSide:
@@ -595,6 +595,8 @@ class MarketMaker:
         """
         In paper mode, check if our resting orders would have filled.
         A BUY order fills if the Polymarket market ask <= our bid price.
+        Fill price = min(our_bid, market_ask) — same as real limit orders
+        (we get price improvement when ask < bid).
         """
         for side, ask in [
             (state.yes, self._last_yes_ask),
@@ -603,11 +605,14 @@ class MarketMaker:
             if side.was_ever_filled or not side.has_order or ask is None:
                 continue
             if side.order.price >= ask:
+                # Fill at market ask (price improvement), not at our bid
+                fill_price = min(side.order.price, ask)
                 side.was_ever_filled = True
                 side.first_fill_time = time.monotonic()
+                side.last_entry_price = fill_price
                 log.info(
-                    "Paper FILL | %s @ %.4f (market ask=%.4f)",
-                    side.side_label, side.order.price, ask,
+                    "Paper FILL | %s @ %.4f (bid=%.4f, market ask=%.4f)",
+                    side.side_label, fill_price, side.order.price, ask,
                 )
 
     # ------------------------------------------------------------------

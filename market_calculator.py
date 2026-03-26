@@ -476,10 +476,11 @@ class MarketCalculator:
         ceiling = raw_ceiling - fee_at_ceiling
 
         if market_ask is not None and market_ask > 0:
-            orderbook_bid = market_ask - MIN_EDGE
-            # Use the best price that doesn't exceed our ceiling
-            bid = min(max(base_bid, orderbook_bid), ceiling)
+            orderbook_cap = market_ask - MIN_EDGE
+            # Orderbook only caps our bid DOWN (avoid overpaying vs ask),
+            # never pushes it UP above base_bid.
+            bid = min(base_bid, orderbook_cap, ceiling)
         else:
-            bid = base_bid
+            bid = min(base_bid, ceiling)
 
         return round(max(Config.MIN_BID_PRICE, bid), 2)
