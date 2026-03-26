@@ -373,7 +373,7 @@ class MarketMaker:
             sigma = self._ob_ws.realized_sigma_5m
             base_sl = Config.STOP_LOSS_BASE
             vol_adj = Config.STOP_LOSS_VOL_SCALE * (sigma / 0.002)
-            time_factor = max(0.3, min(1.0, stc / 120.0))
+            time_factor = max(0.5, min(1.0, stc / 120.0))
             threshold = (base_sl + vol_adj) * time_factor
 
             for side in (state.yes, state.no):
@@ -532,8 +532,10 @@ class MarketMaker:
                 if not self._is_paper:
                     state.yes.was_ever_filled = True
                     state.yes.first_fill_time = time.monotonic()
-            state.yes.last_entry_price = yes_bid
-            state.yes.last_entry_size = yes_size
+            # Lock entry price/size at fill — never overwrite after fill
+            if not state.yes.was_ever_filled:
+                state.yes.last_entry_price = yes_bid
+                state.yes.last_entry_size = yes_size
             tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
         elif state.yes.has_order and not place_yes:
             # Cancel the wrong-side order if it was placed before signal shifted
@@ -547,8 +549,10 @@ class MarketMaker:
                 if not self._is_paper:
                     state.no.was_ever_filled = True
                     state.no.first_fill_time = time.monotonic()
-            state.no.last_entry_price = no_bid
-            state.no.last_entry_size = no_size
+            # Lock entry price/size at fill — never overwrite after fill
+            if not state.no.was_ever_filled:
+                state.no.last_entry_price = no_bid
+                state.no.last_entry_size = no_size
             tasks.append(self._refresh_side(state.no, no_bid, no_size))
         elif state.no.has_order and not place_no:
             tasks.append(self._cancel_side(state.no))
