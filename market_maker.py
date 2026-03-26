@@ -547,34 +547,40 @@ class MarketMaker:
 
         # YES side
         if place_yes and yes_bid >= min_bid and yes_size > 0:
-            if not state.yes.was_ever_active:
-                state.yes.p_signal_at_entry = p_up
-                state.yes.was_ever_active = True
-                if not self._is_paper:
-                    state.yes.was_ever_filled = True
-                    state.yes.first_fill_time = time.monotonic()
-            # Lock entry price/size at fill — never overwrite after fill
-            if not state.yes.was_ever_filled:
+            if state.yes.was_ever_filled:
+                # Already filled — cancel resting order, stop refreshing
+                if state.yes.has_order:
+                    tasks.append(self._cancel_side(state.yes))
+            else:
+                if not state.yes.was_ever_active:
+                    state.yes.p_signal_at_entry = p_up
+                    state.yes.was_ever_active = True
+                    if not self._is_paper:
+                        state.yes.was_ever_filled = True
+                        state.yes.first_fill_time = time.monotonic()
                 state.yes.last_entry_price = yes_bid
                 state.yes.last_entry_size = yes_size
-            tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
+                tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
         elif state.yes.has_order and not place_yes:
             # Cancel the wrong-side order if it was placed before signal shifted
             tasks.append(self._cancel_side(state.yes))
 
         # NO side
         if place_no and no_bid >= min_bid and no_size > 0:
-            if not state.no.was_ever_active:
-                state.no.p_signal_at_entry = p_up
-                state.no.was_ever_active = True
-                if not self._is_paper:
-                    state.no.was_ever_filled = True
-                    state.no.first_fill_time = time.monotonic()
-            # Lock entry price/size at fill — never overwrite after fill
-            if not state.no.was_ever_filled:
+            if state.no.was_ever_filled:
+                # Already filled — cancel resting order, stop refreshing
+                if state.no.has_order:
+                    tasks.append(self._cancel_side(state.no))
+            else:
+                if not state.no.was_ever_active:
+                    state.no.p_signal_at_entry = p_up
+                    state.no.was_ever_active = True
+                    if not self._is_paper:
+                        state.no.was_ever_filled = True
+                        state.no.first_fill_time = time.monotonic()
                 state.no.last_entry_price = no_bid
                 state.no.last_entry_size = no_size
-            tasks.append(self._refresh_side(state.no, no_bid, no_size))
+                tasks.append(self._refresh_side(state.no, no_bid, no_size))
         elif state.no.has_order and not place_no:
             tasks.append(self._cancel_side(state.no))
 
