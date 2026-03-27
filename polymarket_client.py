@@ -356,17 +356,57 @@ class PolymarketClient:
     # ------------------------------------------------------------------
 
     async def get_open_orders(self, token_id: Optional[str] = None) -> List[dict]:
-        """GET /orders?maker={address}&tokenID={token_id}"""
+        """Fetch open orders from CLOB API.
+
+        Tries /data/orders first (current CLOB v2 endpoint), falls back
+        to /orders if that returns 404/405.
+        """
         params: Dict[str, str] = {"maker": self._maker_address}
         if token_id:
             params["tokenID"] = token_id
-        async with self._session.get("/orders", params=params) as r:
-            r.raise_for_status()
-            return await r.json()
+
+        for path in ("/data/orders", "/orders"):
+            try:
+                async with self._session.get(path, params=params) as r:
+                    if r.status in (404, 405):
+                        continue
+                    r.raise_for_status()
+                    data = await r.json()
+                    # API may return list or {"orders": [...]}
+                    if isinstance(data, dict):
+                        return data.get("orders", [])
+                    return data
+            except Exception:
+                continue
+
+        log.warning("Could not fetch open orders — both endpoints failed")
+        return []
 
     async def cancel_all_orders(self) -> None:
-        """Cancel every open order for this account (called on shutdown)."""
-        orders = await self.get_open_orders()
+        """Cancel every open order for this account (called on shutdown).
+
+        Tries DELETE /cancel-all first (bulk cancel), then falls back
+        to cancelling orders individually.
+        """
+        # Try bulk cancel endpoint first
+        try:
+            async with self._session.delete(
+                "/cancel-all",
+                json={"maker": self._maker_address},
+            ) as r:
+                if r.status == 200:
+                    log.info("Bulk cancel-all succeeded")
+                    return
+        except Exception:
+            pass
+
+        # Fallback: fetch and cancel individually
+        try:
+            orders = await self.get_open_orders()
+        except Exception as exc:
+            log.warning("Could not fetch open orders on shutdown: %s", exc)
+            return
+
         if not orders:
             return
         tasks = [

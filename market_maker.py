@@ -455,7 +455,10 @@ class MarketMaker:
     async def _cancel_all_open(self) -> None:
         if self._state:
             await self._cancel_window(self._state)
-        await self._client.cancel_all_orders()
+        try:
+            await self._client.cancel_all_orders()
+        except Exception as exc:
+            log.warning("cancel_all_orders failed on shutdown: %s", exc)
 
     # ------------------------------------------------------------------
     # Order reconciliation
