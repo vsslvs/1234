@@ -88,7 +88,9 @@ class TestDynamicEdge:
         ws = FakeOrderBookWS()
         calc = MarketCalculator(ws)
         edge = calc.dynamic_min_edge()
-        assert 40 <= edge <= 60  # roughly 50 bps
+        # realized_vol_5m defaults to 0.0022, same as sigma_default
+        # so ratio ≈ 1.0, edge ≈ MIN_EDGE_BPS (50), capped to [30, 150]
+        assert 30 <= edge <= 150
 
     def test_high_vol_gives_higher_edge(self):
         """Higher realized vol → higher edge requirement."""

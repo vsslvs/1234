@@ -1,11 +1,13 @@
 """Tests for paper trading client."""
-import pytest
 import asyncio
+
+import pytest
 
 from paper_trading import PaperClient
 
+pytestmark = pytest.mark.asyncio(loop_scope="function")
 
-@pytest.mark.asyncio
+
 async def test_place_and_cancel():
     """Place an order and cancel it."""
     client = PaperClient()
@@ -24,7 +26,6 @@ async def test_place_and_cancel():
     assert len(client._open_orders) == 0
 
 
-@pytest.mark.asyncio
 async def test_cancel_replace():
     """Cancel/replace should remove old and create new."""
     client = PaperClient()
@@ -40,7 +41,6 @@ async def test_cancel_replace():
     assert old.order_id not in client._open_orders
 
 
-@pytest.mark.asyncio
 async def test_cancel_all():
     """Cancel all should clear all orders."""
     client = PaperClient()
@@ -56,7 +56,6 @@ async def test_cancel_all():
     assert len(client._open_orders) == 0
 
 
-@pytest.mark.asyncio
 async def test_get_open_orders_filtered():
     """get_open_orders with token filter."""
     client = PaperClient()
@@ -73,7 +72,6 @@ async def test_get_open_orders_filtered():
     assert len(filtered) == 2
 
 
-@pytest.mark.asyncio
 async def test_check_approvals_noop():
     """check_approvals should be a no-op in paper mode."""
     client = PaperClient()
@@ -81,7 +79,6 @@ async def test_check_approvals_noop():
     await client.check_approvals()  # should not raise
 
 
-@pytest.mark.asyncio
 async def test_summary():
     """Summary should reflect operations."""
     client = PaperClient()
