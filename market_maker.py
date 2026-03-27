@@ -8,27 +8,23 @@ For each 5-minute BTC window:
 1. Look up the Polymarket market for the current window.
 2. Compute fair YES / NO prices using Binance mid-price vs window-open price.
 3. During the ENTRY WINDOW (last ENTRY_WINDOW_SEC seconds before close):
-   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.80
-   - Quote NO  at TARGET_PRICE_NO   (e.g. 0.92) if P(up) < 0.20
+   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.94
+   - Quote NO  at TARGET_PRICE_NO   (e.g. 0.92) if P(up) < 0.06
    - (High-confidence signal only — avoid quoting around 50%)
 4. Every QUOTE_REFRESH_MS ms, check if price has drifted enough to warrant
    a cancel/replace cycle.
 5. 2 seconds before close, cancel all open orders to avoid fills on an
    already-known outcome.
 
-Why only high-confidence entry?
-- Taker fee at p=0.50 is ~1.56%. Even as a maker (0 fee), if you quote
-  at 0.92 on the losing side, you lose $0.92 per share. You need the
-  signal to be right >92% of the time.
-- At ±0.3% BTC move in a 5m window the logistic signal gives ~85%.
-  Combined with the discount rebate, EV is positive.
-- Markets near 50% have the most adverse-selection risk from faster bots.
-
-Rebate mechanic
+Risk management
 ---------------
-Polymarket pays USDC rebates to makers funded by taker fees.
-We don't model the exact rebate here — it is paid out daily and adds
-to P&L on top of the spread captured at resolution.
+- Pre-trade exposure check (MAX_EXPOSURE_USDC enforced)
+- Session drawdown limit
+- Daily loss limit
+- Consecutive loss circuit breaker
+- Kelly-inspired position sizing (fractional, conservative)
+- Order state reconciliation every 60 seconds
+- Volatility gate on extreme candle ranges
 
 Cancel/replace < 100 ms
 -----------------------
@@ -40,12 +36,13 @@ asyncio.gather brings total wall-clock time to max(cancel_rtt, place_rtt).
 import asyncio
 import logging
 import time
-from typing import Dict, Optional
+from typing import Optional
 
 from config import Config
 from dashboard import EventBus
 from market_calculator import BtcMarket, MarketCalculator, K_SIGNAL
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY
+from risk_manager import RiskManager
 from stats import BotStats
 from ws_orderbook import OrderBookWS
 
@@ -58,6 +55,9 @@ PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
 # Using 0.94 gives ~200 bps expected edge at entry, providing a safety margin.
 P_UP_THRESHOLD   = 0.94
 P_DOWN_THRESHOLD = 0.06
+
+# Order reconciliation interval (seconds)
+_RECONCILE_INTERVAL_SEC = 60
 
 
 class MarketSide:
@@ -73,6 +73,7 @@ class MarketSide:
         self.was_ever_active:    bool  = False   # True if an order was placed this window
         self.p_signal_at_entry:  float = 0.0     # logistic p when first order was placed
         self.last_entry_price:   float = 0.0     # price of first order this window
+        self.last_entry_size:    float = 0.0     # actual size (may be Kelly-adjusted)
 
     @property
     def has_order(self) -> bool:
@@ -124,8 +125,10 @@ class MarketMaker:
         self._state:  Optional[WindowState] = None
         self._running = False
         self._stats   = BotStats()
+        self._risk    = RiskManager()
         self._windows_since_stats_log = 0
         self._last_state_push: float = 0.0
+        self._last_reconcile: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -154,7 +157,7 @@ class MarketMaker:
     async def stop(self) -> None:
         self._running = False
         self._stats.log_summary(
-            k=K_SIGNAL,
+            k=self._calc.adaptive_k(),
             entry_window_sec=Config.ENTRY_WINDOW_SEC,
             market_window_sec=Config.MARKET_WINDOW_SEC,
             threshold=P_UP_THRESHOLD,
@@ -183,6 +186,9 @@ class MarketMaker:
         # Push state snapshot to dashboard (throttled to ~1/sec)
         self._push_dashboard_state(market)
 
+        # Periodic order reconciliation
+        await self._maybe_reconcile()
+
         # Exit window: cancel everything and wait for resolution
         if market.seconds_to_close <= Config.EXIT_WINDOW_SEC:
             await self._cancel_window(state)
@@ -190,6 +196,12 @@ class MarketMaker:
 
         # Only quote during entry window
         if not market.is_entry_window:
+            return
+
+        # Staleness guard — cancel all if price data is stale
+        if self._ob_ws.book.is_stale:
+            log.warning("Price data stale — cancelling orders for safety")
+            await self._cancel_window(state)
             return
 
         await self._quote_window(state, market)
@@ -202,11 +214,16 @@ class MarketMaker:
             log.info("Window rolled over — cancelling old orders")
             await self._cancel_window(self._state)
 
+            # Release exposure for resolved window
+            for side in (self._state.yes, self._state.no):
+                if side.was_ever_active:
+                    self._risk.release_exposure(side.last_entry_size)
+
             self._windows_since_stats_log += 1
             if self._windows_since_stats_log >= Config.STATS_LOG_INTERVAL:
                 self._windows_since_stats_log = 0
                 self._stats.log_summary(
-                    k=K_SIGNAL,
+                    k=self._calc.adaptive_k(),
                     entry_window_sec=Config.ENTRY_WINDOW_SEC,
                     market_window_sec=Config.MARKET_WINDOW_SEC,
                     threshold=P_UP_THRESHOLD,
@@ -224,10 +241,6 @@ class MarketMaker:
     async def _quote_window(self, state: WindowState, market: BtcMarket) -> None:
         """Place or refresh maker orders based on directional signal."""
         # --- Volatility gate -------------------------------------------
-        # Skip trading if the recent Binance 5-minute candle range is extreme.
-        # A high-low range > VOLATILITY_GATE_BPS signals a flash-crash, major
-        # news event, or severely illiquid conditions where the random-walk model
-        # breaks down and EV can turn negative.
         candle_vol = self._ob_ws.candle.volatility_bps
         if candle_vol > Config.VOLATILITY_GATE_BPS:
             log.debug(
@@ -237,26 +250,30 @@ class MarketMaker:
             await self._cancel_window(state)
             return
 
-        # fair_prices() calls p_up_signal() internally — no duplicate call needed.
-        # fair_prices returns (p_up, 1-p_up), so fair_yes == p_up by definition.
+        # fair_prices() now returns fee-adjusted values
         fair_yes, fair_no = self._calc.fair_prices(market)
-        p_up = fair_yes
+        p_up = self._calc.p_up_signal(market)
+
+        # Dynamic edge requirement based on realized vol
+        min_edge = self._calc.dynamic_min_edge()
 
         tasks = []
 
         # ----- YES side: buy UP token if strong upside signal -----
         if p_up > P_UP_THRESHOLD:
             target = Config.TARGET_PRICE_YES
-            # BUY edge = (fair - target) × 10000.
-            # Positive means we are buying BELOW our estimated fair value.
             edge = (fair_yes - target) * 10_000
-            if edge >= Config.MIN_EDGE_BPS:
-                # Record entry stats on the FIRST order of this window only
-                if not state.yes.was_ever_active:
-                    state.yes.p_signal_at_entry = p_up
-                    state.yes.last_entry_price  = target
-                    state.yes.was_ever_active   = True
-                tasks.append(self._refresh_side(state.yes, target))
+            if edge >= min_edge:
+                # Kelly position sizing
+                order_size = self._compute_order_size(p_up, target)
+                if order_size > 0:
+                    # Record entry stats on the FIRST order of this window only
+                    if not state.yes.was_ever_active:
+                        state.yes.p_signal_at_entry = p_up
+                        state.yes.last_entry_price  = target
+                        state.yes.last_entry_size   = order_size
+                        state.yes.was_ever_active   = True
+                    tasks.append(self._refresh_side(state.yes, target, order_size))
         else:
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
@@ -264,20 +281,43 @@ class MarketMaker:
         # ----- NO side: buy DOWN token if strong downside signal -----
         if p_up < P_DOWN_THRESHOLD:
             target = Config.TARGET_PRICE_NO
-            # BUY edge for NO: (fair_no - target) × 10000
             edge = (fair_no - target) * 10_000
-            if edge >= Config.MIN_EDGE_BPS:
-                if not state.no.was_ever_active:
-                    state.no.p_signal_at_entry = p_up
-                    state.no.last_entry_price  = target
-                    state.no.was_ever_active   = True
-                tasks.append(self._refresh_side(state.no, target))
+            if edge >= min_edge:
+                order_size = self._compute_order_size(1.0 - p_up, target)
+                if order_size > 0:
+                    if not state.no.was_ever_active:
+                        state.no.p_signal_at_entry = p_up
+                        state.no.last_entry_price  = target
+                        state.no.last_entry_size   = order_size
+                        state.no.was_ever_active   = True
+                    tasks.append(self._refresh_side(state.no, target, order_size))
         else:
             if state.no.has_order:
                 tasks.append(self._cancel_side(state.no))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _compute_order_size(self, p_signal: float, target_price: float) -> float:
+        """Compute order size with Kelly sizing and risk check."""
+        base_size = Config.ORDER_SIZE_USDC
+
+        # Kelly-adjusted sizing
+        if Config.KELLY_ENABLED:
+            size = self._risk.adjusted_size(base_size, p_signal, target_price)
+        else:
+            size = base_size
+
+        if size <= 0:
+            return 0.0
+
+        # Pre-trade risk check
+        allowed, reason = self._risk.can_trade("", size, target_price)
+        if not allowed:
+            log.info("Risk gate blocked: %s", reason)
+            return 0.0
+
+        return size
 
     def _evaluate_and_record_window(self, state: WindowState) -> None:
         """
@@ -287,10 +327,6 @@ class MarketMaker:
           actual_up = (Binance mid at rollover) >= (window open price)
         This proxies the Chainlink oracle resolution.  Correlation between
         Binance and Chainlink BTC/USD is >99.9% on 5-minute scales.
-
-        We record only sides that were ever active (had an order placed).
-        The stats fields (was_ever_active, p_signal_at_entry, last_entry_price)
-        survive the EXIT_WINDOW cancel, so they are readable here at rollover.
         """
         market = state.market
         mid    = self._ob_ws.book.mid_price
@@ -305,22 +341,30 @@ class MarketMaker:
             # YES token wins if BTC closed up; NO token wins if BTC closed down
             signal_is_up = (side.side_label == "YES")
             won = (btc_closed_up == signal_is_up)
+
+            size = side.last_entry_size or Config.ORDER_SIZE_USDC
+            shares = size / side.last_entry_price
+            pnl = shares * (1.0 - side.last_entry_price) if won else -size
+
             self._stats.record_trade(
                 window_start=market.window_start,
                 side=side.side_label,
                 entry_price=side.last_entry_price,
-                size_usdc=Config.ORDER_SIZE_USDC,
+                size_usdc=size,
                 p_signal=side.p_signal_at_entry,
                 won=won,
             )
+
+            # Update risk manager
+            self._risk.record_resolution(won, pnl)
+
             # Emit trade event to dashboard
             if self._bus:
-                shares = Config.ORDER_SIZE_USDC / side.last_entry_price
-                pnl = shares * (1.0 - side.last_entry_price) if won else -Config.ORDER_SIZE_USDC
                 self._bus.push_trade({
                     "window_start": market.window_start,
                     "side": side.side_label,
                     "entry_price": side.last_entry_price,
+                    "size_usdc": size,
                     "p_signal": side.p_signal_at_entry,
                     "won": won,
                     "pnl": round(pnl, 2),
@@ -340,6 +384,7 @@ class MarketMaker:
 
         self._bus.push_state({
             "status": "running" if self._running else "stopped",
+            "mode": "paper" if Config.PAPER_MODE else "live",
             "btc_price": self._ob_ws.book.mid_price,
             "uptime_sec": round(time.time() - self._stats._session_start, 0),
             "wallet": Config.PRIVATE_KEY[:6] + "..." + Config.PRIVATE_KEY[-4:],
@@ -347,15 +392,23 @@ class MarketMaker:
             "seconds_to_close": round(market.seconds_to_close, 0),
             "is_entry_window": market.is_entry_window,
             "stats": self._stats.to_dict(),
+            "risk": self._risk.to_dict(),
             "markets": self._calc.get_markets_snapshot(),
+            "adaptive_k": round(self._calc.adaptive_k(), 0),
+            "realized_vol": round(self._ob_ws.realized_vol_5m * 100, 4),
         })
 
     # ------------------------------------------------------------------
     # Order helpers
     # ------------------------------------------------------------------
 
-    async def _refresh_side(self, side: MarketSide, target_price: float) -> None:
+    async def _refresh_side(
+        self, side: MarketSide, target_price: float, size_usdc: float = None,
+    ) -> None:
         """Place a new order or cancel/replace if price drifted."""
+        if size_usdc is None:
+            size_usdc = Config.ORDER_SIZE_USDC
+
         if not side.has_order:
             # Fresh placement
             try:
@@ -363,9 +416,11 @@ class MarketMaker:
                     token_id=side.token_id,
                     side=SIDE_BUY,        # buying the outcome token
                     price=target_price,
-                    size_usdc=Config.ORDER_SIZE_USDC,
+                    size_usdc=size_usdc,
                 )
                 side.order = order
+                # Record fill in risk manager
+                self._risk.record_fill(side.side_label, size_usdc, target_price)
             except Exception as exc:
                 log.error("place_maker_order %s failed: %s", side.side_label, exc)
         elif side.price_drifted(target_price):
@@ -401,6 +456,39 @@ class MarketMaker:
         if self._state:
             await self._cancel_window(self._state)
         await self._client.cancel_all_orders()
+
+    # ------------------------------------------------------------------
+    # Order reconciliation
+    # ------------------------------------------------------------------
+
+    async def _maybe_reconcile(self) -> None:
+        """Periodically check CLOB for orphaned orders."""
+        now = time.monotonic()
+        if now - self._last_reconcile < _RECONCILE_INTERVAL_SEC:
+            return
+        self._last_reconcile = now
+
+        try:
+            clob_orders = await self._client.get_open_orders()
+            known_ids = set()
+            if self._state:
+                for side in (self._state.yes, self._state.no):
+                    if side.order:
+                        known_ids.add(side.order.order_id)
+
+            orphaned = [
+                o for o in clob_orders
+                if (o.get("id") or o.get("orderID", "")) not in known_ids
+            ]
+            if orphaned:
+                log.warning("Found %d orphaned orders on CLOB — cancelling", len(orphaned))
+                tasks = [
+                    self._client.cancel_order(o.get("id") or o.get("orderID", ""))
+                    for o in orphaned
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as exc:
+            log.debug("Reconciliation failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Background market list refresh (every 10 minutes)
