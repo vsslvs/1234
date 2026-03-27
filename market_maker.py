@@ -243,9 +243,9 @@ class MarketMaker:
         # --- Volatility gate -------------------------------------------
         candle_vol = self._ob_ws.candle.volatility_bps
         if candle_vol > Config.VOLATILITY_GATE_BPS:
-            log.debug(
-                "Vol gate: window=%d  candle_vol=%.0f bps > gate=%.0f bps — skip",
-                state.market.window_start, candle_vol, Config.VOLATILITY_GATE_BPS,
+            log.info(
+                "Vol gate: candle_vol=%.0f bps > gate=%.0f bps — skipping window",
+                candle_vol, Config.VOLATILITY_GATE_BPS,
             )
             await self._cancel_window(state)
             return
@@ -256,6 +256,17 @@ class MarketMaker:
 
         # Dynamic edge requirement based on realized vol
         min_edge = self._calc.dynamic_min_edge()
+
+        # Log signal diagnostics once per entry window
+        if not state.yes.was_ever_active and not state.no.was_ever_active:
+            log.info(
+                "Entry window | p_up=%.4f  fair_yes=%.4f  fair_no=%.4f  "
+                "min_edge=%.0f bps  closes_in=%.1fs  "
+                "thresh_up=%.2f  thresh_down=%.2f",
+                p_up, fair_yes, fair_no, min_edge,
+                market.seconds_to_close,
+                P_UP_THRESHOLD, P_DOWN_THRESHOLD,
+            )
 
         tasks = []
 
@@ -273,7 +284,17 @@ class MarketMaker:
                         state.yes.last_entry_price  = target
                         state.yes.last_entry_size   = order_size
                         state.yes.was_ever_active   = True
+                        log.info(
+                            "Placing YES order: p_up=%.4f  target=%.4f  edge=%.0f bps  size=%.2f USDC",
+                            p_up, target, edge, order_size,
+                        )
                     tasks.append(self._refresh_side(state.yes, target, order_size))
+            else:
+                if not state.yes.was_ever_active:
+                    log.info(
+                        "YES signal strong (p_up=%.4f) but edge too low: %.0f < %.0f bps",
+                        p_up, edge, min_edge,
+                    )
         else:
             if state.yes.has_order:
                 tasks.append(self._cancel_side(state.yes))
@@ -290,7 +311,17 @@ class MarketMaker:
                         state.no.last_entry_price  = target
                         state.no.last_entry_size   = order_size
                         state.no.was_ever_active   = True
+                        log.info(
+                            "Placing NO order: p_up=%.4f  target=%.4f  edge=%.0f bps  size=%.2f USDC",
+                            p_up, target, edge, order_size,
+                        )
                     tasks.append(self._refresh_side(state.no, target, order_size))
+            else:
+                if not state.no.was_ever_active:
+                    log.info(
+                        "NO signal strong (p_up=%.4f) but edge too low: %.0f < %.0f bps",
+                        p_up, edge, min_edge,
+                    )
         else:
             if state.no.has_order:
                 tasks.append(self._cancel_side(state.no))
