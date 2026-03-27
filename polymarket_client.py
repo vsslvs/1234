@@ -383,12 +383,12 @@ class PolymarketClient:
         return []
 
     async def cancel_all_orders(self) -> None:
-        """Cancel every open order for this account (called on shutdown).
+        """Best-effort bulk cancel on shutdown.
 
-        Tries DELETE /cancel-all first (bulk cancel), then falls back
-        to cancelling orders individually.
+        DELETE /cancel-all requires L2 HMAC API credentials.
+        Without them, we rely on MarketMaker._cancel_window() which
+        cancels individually tracked orders before calling this method.
         """
-        # Try bulk cancel endpoint first
         try:
             async with self._session.delete(
                 "/cancel-all",
@@ -397,25 +397,9 @@ class PolymarketClient:
                 if r.status == 200:
                     log.info("Bulk cancel-all succeeded")
                     return
-        except Exception:
-            pass
-
-        # Fallback: fetch and cancel individually
-        try:
-            orders = await self.get_open_orders()
+                log.debug("cancel-all returned %s (expected without API keys)", r.status)
         except Exception as exc:
-            log.warning("Could not fetch open orders on shutdown: %s", exc)
-            return
-
-        if not orders:
-            return
-        tasks = [
-            self.cancel_order(o.get("id") or o.get("orderID", ""))
-            for o in orders
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        cancelled = sum(1 for r in results if r is True)
-        log.info("Cancelled %d / %d open orders on shutdown", cancelled, len(orders))
+            log.debug("cancel-all request failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Approval check (one-time setup)
@@ -423,27 +407,15 @@ class PolymarketClient:
 
     async def check_approvals(self) -> None:
         """
-        Verify that the exchange contract is approved for USDC and
-        conditional tokens. Log a warning if not — the user must run the
-        one-time approval transaction before the bot can trade.
-        """
-        async with self._session.get(
-            "/auth/approvals",
-            params={"address": self._maker_address},
-        ) as r:
-            if r.status != 200:
-                log.warning("Could not check approvals (status %s)", r.status)
-                return
-            data = await r.json()
+        Check token approvals.
 
-        if not data.get("usdcApproved"):
-            log.error(
-                "USDC not approved for exchange contract %s. "
-                "Run the one-time approval before trading.",
-                Config.EXCHANGE_ADDRESS,
-            )
-        if not data.get("conditionalTokenApproved"):
-            log.error(
-                "Conditional tokens not approved. "
-                "Run the one-time approval before trading.",
-            )
+        The /balance-allowance endpoint requires L2 HMAC API credentials.
+        Without API keys we cannot query approvals programmatically.
+        The bot will still work — if approvals are missing, order
+        placement will fail with a clear error from the CLOB.
+        """
+        log.info(
+            "Approval check skipped (requires CLOB API keys). "
+            "Ensure USDC and conditional tokens are approved for %s.",
+            Config.EXCHANGE_ADDRESS,
+        )

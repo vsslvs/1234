@@ -450,7 +450,7 @@ class MarketMaker:
             tasks.append(self._cancel_side(state.no))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        log.info("Cancelled all orders for window %s", state.market.window_start)
+            log.info("Cancelled all orders for window %s", state.market.window_start)
 
     async def _cancel_all_open(self) -> None:
         if self._state:
@@ -465,33 +465,15 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     async def _maybe_reconcile(self) -> None:
-        """Periodically check CLOB for orphaned orders."""
-        now = time.monotonic()
-        if now - self._last_reconcile < _RECONCILE_INTERVAL_SEC:
-            return
-        self._last_reconcile = now
+        """Reconcile local order state.
 
-        try:
-            clob_orders = await self._client.get_open_orders()
-            known_ids = set()
-            if self._state:
-                for side in (self._state.yes, self._state.no):
-                    if side.order:
-                        known_ids.add(side.order.order_id)
-
-            orphaned = [
-                o for o in clob_orders
-                if (o.get("id") or o.get("orderID", "")) not in known_ids
-            ]
-            if orphaned:
-                log.warning("Found %d orphaned orders on CLOB — cancelling", len(orphaned))
-                tasks = [
-                    self._client.cancel_order(o.get("id") or o.get("orderID", ""))
-                    for o in orphaned
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as exc:
-            log.debug("Reconciliation failed: %s", exc)
+        Note: querying open orders from CLOB requires L2 HMAC API
+        credentials which are not yet configured.  For now we rely on
+        local order tracking (MarketSide.order) which is kept in sync
+        by _refresh_side / _cancel_side.  If CLOB API keys are added
+        later, this can be extended to query /data/orders.
+        """
+        pass
 
     # ------------------------------------------------------------------
     # Background market list refresh (every 10 minutes)
