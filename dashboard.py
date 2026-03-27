@@ -191,6 +191,26 @@ async def _handle_index(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html")
 
 
+async def _handle_health(request: web.Request) -> web.Response:
+    """GET /health — lightweight health check for monitoring."""
+    bus: EventBus = request.app["event_bus"]
+    state = bus.last_state
+    data = state.get("data", {}) if state else {}
+
+    uptime = data.get("uptime_sec", 0)
+    btc_price = data.get("btc_price")
+    mode = data.get("mode", "live")
+
+    status = "ok" if btc_price is not None else "degraded"
+    return web.json_response({
+        "status": status,
+        "mode": mode,
+        "uptime_sec": uptime,
+        "btc_price": btc_price,
+        "ws_clients": len(bus._subscribers),
+    })
+
+
 async def _handle_ws(request: web.Request) -> web.WebSocketResponse:
     if not _check_ws_token(request):
         return web.Response(status=403, text="Forbidden")
@@ -235,6 +255,7 @@ async def start_dashboard(event_bus: EventBus) -> web.AppRunner:
     app["event_bus"] = event_bus
     app["ws_tokens"] = {}  # token -> monotonic timestamp
     app.router.add_get("/", _handle_index)
+    app.router.add_get("/health", _handle_health)
     app.router.add_get("/ws", _handle_ws)
 
     runner = web.AppRunner(app, access_log=None)

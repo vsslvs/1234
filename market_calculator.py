@@ -9,18 +9,15 @@ Market window boundaries (UTC):
     window_start = window_index * 300
     window_end   = window_start + 300
 
-The token IDs for YES / NO sides of each market can be derived from the
-question text or fetched from the Gamma API. This module provides:
-
+This module provides:
 1. Timing helpers (seconds to window close, is it entry/exit window)
 2. A lightweight Gamma API client to fetch today's market token IDs
-3. A btc_direction_signal() function that estimates probability of UP
-   based on current Binance price vs window-open price
-
-Usage:
-    calc = MarketCalculator(btc_ws)
-    market = await calc.current_market()
-    p_up = calc.p_up_signal()
+3. A composite signal that estimates probability of UP using:
+   - Logistic curve on BTC return (primary)
+   - Order-flow imbalance (confirmation)
+   - Multi-timeframe 1m candle (filter)
+   - Adaptive K calibrated to realized volatility
+4. Fee-adjusted fair pricing
 """
 import asyncio
 import json as _json
@@ -41,7 +38,7 @@ log = logging.getLogger(__name__)
 GAMMA_API = "https://gamma-api.polymarket.com"
 WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 
-# Logistic signal steepness.  Maps BTC return at entry → win probability.
+# Logistic signal steepness — fallback value.
 #
 # Calibration (random-walk model):
 #   σ₅    = 0.22%   (BTC 5-min vol: 60% annual → 5-min window)
@@ -59,7 +56,17 @@ WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 #     σ₅ = 0.22% → P = 99.97%  (typical day)
 #     σ₅ = 0.50% → P = 93.6%   (high-vol,  EV > 0)
 #     σ₅ > 0.70% → not traded  (VOLATILITY_GATE blocks)
-K_SIGNAL: float = 2000.0
+K_SIGNAL_DEFAULT: float = 2000.0
+
+# Clamp bounds for adaptive K
+K_SIGNAL_MIN: float = 500.0
+K_SIGNAL_MAX: float = 8000.0
+
+# Re-export for backward compatibility
+K_SIGNAL = K_SIGNAL_DEFAULT
+
+# Multi-timeframe confidence reduction when 1m contradicts 5m
+_MTF_PENALTY: float = 0.20  # reduce confidence by 20%
 
 
 @dataclass
@@ -100,10 +107,32 @@ def seconds_to_next_window() -> float:
     return current_window_end() - time.time()
 
 
+def _phi_inv(p: float) -> float:
+    """Approximate inverse standard normal CDF (probit function).
+
+    Uses the rational approximation from Abramowitz & Stegun.
+    Accurate to ~4.5 × 10⁻⁴ for 0.01 ≤ p ≤ 0.99.
+    """
+    if p <= 0 or p >= 1:
+        return 0.0
+    # Symmetry: if p > 0.5, use 1-p
+    if p > 0.5:
+        return -_phi_inv(1.0 - p)
+    t = math.sqrt(-2.0 * math.log(p))
+    c0, c1, c2 = 2.515517, 0.802853, 0.010328
+    d1, d2, d3 = 1.432788, 0.189269, 0.001308
+    return -(t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t))
+
+
 class MarketCalculator:
     """
     Fetches live Polymarket 5-min BTC market metadata and computes
     the directional signal (probability of UP) from the Binance price feed.
+
+    Signal components:
+      1. Logistic return signal (primary) with adaptive K
+      2. Order-flow imbalance (confirmation, weight = OFI_WEIGHT)
+      3. 1-minute candle trend (filter — penalizes contradictions)
     """
 
     def __init__(self, ob_ws: OrderBookWS):
@@ -120,6 +149,42 @@ class MarketCalculator:
     async def __aexit__(self, *_):
         if self._session:
             await self._session.close()
+
+    # ------------------------------------------------------------------
+    # Adaptive signal calibration
+    # ------------------------------------------------------------------
+
+    def adaptive_k(self) -> float:
+        """
+        Compute logistic steepness K from realized volatility.
+
+        K = logit(threshold) / (Φ⁻¹(threshold) × σ_remaining)
+
+        Where σ_remaining = σ_5m_realized × √(entry_window_sec / window_sec)
+
+        In low-vol regimes K increases (signal is more confident per unit
+        of return). In high-vol regimes K decreases (same return is less
+        meaningful). Clamped to [K_SIGNAL_MIN, K_SIGNAL_MAX].
+        """
+        sigma_5m = self._ob_ws.realized_vol_5m
+        if sigma_5m <= 0:
+            return K_SIGNAL_DEFAULT
+
+        sigma_remaining = sigma_5m * math.sqrt(
+            Config.ENTRY_WINDOW_SEC / Config.MARKET_WINDOW_SEC
+        )
+        if sigma_remaining <= 0:
+            return K_SIGNAL_DEFAULT
+
+        threshold = 0.94  # P_UP_THRESHOLD
+        logit_t = math.log(threshold / (1.0 - threshold))
+        phi_inv_t = _phi_inv(threshold)
+
+        if phi_inv_t == 0:
+            return K_SIGNAL_DEFAULT
+
+        k = logit_t / (phi_inv_t * sigma_remaining)
+        return max(K_SIGNAL_MIN, min(K_SIGNAL_MAX, k))
 
     # ------------------------------------------------------------------
     # Market discovery via Gamma API
@@ -286,45 +351,77 @@ class MarketCalculator:
         return self._markets.get(ws)
 
     # ------------------------------------------------------------------
-    # Directional signal
+    # Directional signal — composite
     # ------------------------------------------------------------------
 
     def p_up_signal(self, market: BtcMarket) -> float:
         """
         Estimate P(BTC closes UP) for the current window.
 
-        Method: compare current mid-price to the window-open price.
-        - If we don't have the window-open price yet, record it now.
-        - Return a probability in [0, 1] using a logistic curve on the
-          return magnitude, tuned so that ±0.3% move → ~85% confidence.
+        Composite signal:
+          1. Logistic on return (primary) — adaptive K from realized vol
+          2. Order-flow imbalance (secondary) — bid/ask volume skew
+          3. Multi-timeframe filter — 1m candle contradiction penalty
 
-        This is a simple signal. In production you would blend this with
-        order-flow imbalance, vol surface, etc.
+        Returns 0.5 (neutral) if data is stale or unavailable.
         """
         mid = self._ob_ws.book.mid_price
         if mid is None:
             return 0.5
 
+        # Staleness check — don't trade on old data
+        if self._ob_ws.book.is_stale:
+            return 0.5
+
         if market.open_price is None:
             # Use the Binance 5-minute candle open as the window reference price.
-            # Binance 5m candles share the same UTC-based grid as Polymarket 5m windows
-            # (both align to multiples of 300 seconds), so candle.open is the BTC price
-            # at window_start — exactly what the signal needs.
-            # Fallback to mid only if kline data is unavailable (e.g. at startup).
             candle_open = self._ob_ws.candle.open
             market.open_price = candle_open if candle_open > 0 else mid
 
+        # 1. Primary: logistic return signal with adaptive K
         ret = (mid - market.open_price) / market.open_price
-        p_up = 1.0 / (1.0 + math.exp(-K_SIGNAL * ret))
-        return p_up
+        k = self.adaptive_k()
+        exponent = -k * ret
+        # Clamp to avoid OverflowError on extreme returns
+        exponent = max(-500, min(500, exponent))
+        p_logistic = 1.0 / (1.0 + math.exp(exponent))
+
+        # 2. Secondary: order-flow imbalance blending
+        ofi = self._ob_ws.book.order_flow_imbalance
+        ofi_weight = Config.OFI_WEIGHT
+
+        # OFI adjustment is largest near p=0.5 (uncertain) and smallest
+        # at extremes. This is correct: OFI helps resolve ambiguity,
+        # but should not override a strong price-return signal.
+        uncertainty = 0.5 - abs(p_logistic - 0.5)
+        p_combined = p_logistic + ofi_weight * ofi * uncertainty
+
+        # 3. Multi-timeframe: 1m candle contradiction penalty
+        candle_1m_dir = self._ob_ws.candle_1m.direction
+        if candle_1m_dir != 0:
+            # Signal direction from logistic
+            signal_dir = 1 if p_combined > 0.5 else -1
+            if candle_1m_dir != signal_dir:
+                # 1m candle contradicts — reduce confidence toward 0.5
+                p_combined = p_combined + _MTF_PENALTY * (0.5 - p_combined)
+
+        # Clamp to [0.01, 0.99] — never fully certain
+        return max(0.01, min(0.99, p_combined))
 
     def fair_prices(self, market: BtcMarket) -> tuple[float, float]:
         """
         Returns (fair_yes, fair_no) based on directional signal.
-        fair_yes + fair_no should equal ~1.0.
+
+        Fee-adjusted: subtracts taker fee from raw probabilities.
+        This accounts for the cost of being filled by an informed taker
+        (adverse selection cost) and makes entry criteria more conservative.
         """
         p_up = self.p_up_signal(market)
-        return p_up, 1.0 - p_up
+        fee_yes = self.taker_fee(p_up)
+        fee_no = self.taker_fee(1.0 - p_up)
+        fair_yes = p_up - fee_yes
+        fair_no = (1.0 - p_up) - fee_no
+        return fair_yes, fair_no
 
     def taker_fee(self, p: float) -> float:
         """
@@ -342,3 +439,15 @@ class MarketCalculator:
         We only place orders where |edge| > MIN_EDGE_BPS.
         """
         return (quoted - fair) * 10_000
+
+    def dynamic_min_edge(self) -> float:
+        """
+        Scale minimum edge requirement with realized volatility.
+        Higher vol = require more edge. Capped between 30 and 150 bps.
+        """
+        sigma_5m = self._ob_ws.realized_vol_5m
+        sigma_default = 0.0022
+        if sigma_default <= 0:
+            return Config.MIN_EDGE_BPS
+        ratio = sigma_5m / sigma_default
+        return max(30, min(150, Config.MIN_EDGE_BPS * ratio))
