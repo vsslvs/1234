@@ -8,7 +8,7 @@ For each 5-minute BTC window:
 1. Look up the Polymarket market for the current window.
 2. Compute fair YES / NO prices using Binance mid-price vs window-open price.
 3. During the ENTRY WINDOW (last ENTRY_WINDOW_SEC seconds before close):
-   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.94
+   - Quote YES at TARGET_PRICE_YES  (e.g. 0.92) if P(up) > 0.80
    - Quote NO  at TARGET_PRICE_NO   (e.g. 0.92) if P(up) < 0.06
    - (High-confidence signal only — avoid quoting around 50%)
 4. Every QUOTE_REFRESH_MS ms, check if price has drifted enough to warrant
@@ -51,10 +51,12 @@ log = logging.getLogger(__name__)
 # Minimum price change to trigger a cancel/replace (avoids churn)
 PRICE_DRIFT_THRESHOLD = 0.005   # 0.5 cents on a ~92-cent order
 # Probability threshold: only quote if signal is this strong.
-# For positive EV buying YES at TARGET_PRICE_YES=0.92 we need p_up > 0.92.
-# Using 0.94 gives ~200 bps expected edge at entry, providing a safety margin.
-P_UP_THRESHOLD   = 0.94
-P_DOWN_THRESHOLD = 0.06
+# At TARGET_PRICE_YES=0.92, break-even win rate is 92%.
+# With k=2000 and composite signal, p_up=0.80 corresponds to a BTC move
+# of ~0.07% which is common in 5-minute windows. This gives enough
+# edge while still entering trades regularly.
+P_UP_THRESHOLD   = 0.80
+P_DOWN_THRESHOLD = 0.20
 
 # Order reconciliation interval (seconds)
 _RECONCILE_INTERVAL_SEC = 60

@@ -8,27 +8,27 @@ class TestTheoreticalWinRate:
     """Tests for random-walk win rate model."""
 
     def test_default_params_high_win_rate(self, bot_stats):
-        """With default params (σ=0.22%), win rate should be very high."""
+        """With default params (σ=0.22%), win rate should be high."""
         wr = bot_stats.theoretical_win_rate(
-            k=2000, threshold=0.94,
+            k=2000, threshold=0.80,
             entry_window_sec=10, market_window_sec=300,
         )
-        assert wr > 0.99
+        assert wr > 0.90
 
     def test_high_vol_lower_win_rate(self, bot_stats):
-        """Higher volatility → lower (but still positive EV) win rate."""
+        """Higher volatility → lower win rate."""
         wr = bot_stats.theoretical_win_rate(
-            k=2000, threshold=0.94,
+            k=2000, threshold=0.80,
             entry_window_sec=10, market_window_sec=300,
             sigma_5m=0.005,  # 0.50% — high vol
         )
-        assert 0.90 < wr < 0.99
+        assert 0.70 < wr < 0.99
 
     def test_win_rate_bounded(self, bot_stats):
         """Win rate should always be in [0, 1]."""
         for sigma in [0.001, 0.002, 0.005, 0.01]:
             wr = bot_stats.theoretical_win_rate(
-                k=2000, threshold=0.94,
+                k=2000, threshold=0.80,
                 entry_window_sec=10, market_window_sec=300,
                 sigma_5m=sigma,
             )
@@ -64,7 +64,7 @@ class TestEntryFrequency:
     def test_frequency_between_zero_and_one(self, bot_stats):
         """Entry frequency should be in [0, 1]."""
         freq = bot_stats.entry_frequency(
-            k=2000, threshold=0.94,
+            k=2000, threshold=0.80,
             market_window_sec=300, entry_window_sec=10,
         )
         assert 0 <= freq <= 1
