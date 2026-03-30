@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 # Default signal parameters (same as live)
 DEFAULT_K = 2000.0
-DEFAULT_THRESHOLD = 0.94
+DEFAULT_THRESHOLD = 0.80
 DEFAULT_ENTRY_PRICE = 0.92
 DEFAULT_SIZE_USDC = 50.0
 DEFAULT_SIGMA_5M = 0.0022

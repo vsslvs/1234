@@ -28,18 +28,18 @@ where:
     σ_remaining = σ₅ × √(ENTRY_WINDOW_SEC / MARKET_WINDOW_SEC)
     σ₅          ≈ 0.22%  (BTC annualised-vol 60% → 5-min window)
 
-At entry threshold (P_UP_THRESHOLD = 0.94):
-    ret_min     = ln(0.94 / 0.06) / k
+At entry threshold (P_UP_THRESHOLD = 0.80):
+    ret_min     = ln(0.80 / 0.20) / k
     True P      = Φ(ret_min / σ_remaining)
 
-For exact calibration at σ₅ = 0.22%:  k_exact   = 4 421
+For exact calibration at σ₅ = 0.22%:  k_exact   = 4 115
 For safety margin at σ₅ = 0.50%:       k_safe    = 2 000  ← used
 (VOLATILITY_GATE_BPS = 200 ensures we skip windows where σ₅ > 0.70%,
  preserving positive EV across all traded conditions.)
 
-Theoretical win rates with k = 2 000, threshold = 0.94:
-    σ₅ = 0.22%  → P = 99.97%  (typical day)
-    σ₅ = 0.50%  → P = 93.6%   (high-vol day, still > break-even 92%)
+Theoretical win rates with k = 2 000, threshold = 0.80:
+    σ₅ = 0.22%  → P ≈ 97%    (typical day)
+    σ₅ = 0.50%  → P ≈ 88%    (high-vol day, marginal EV)
     σ₅ > 0.70%  → not traded  (blocked by volatility gate)
 
 Break-even win rate = TARGET_PRICE_YES = 0.92  (derivation: p = price).
@@ -261,7 +261,7 @@ class BotStats:
         k:                 float,
         entry_window_sec:  int,
         market_window_sec: int,
-        threshold:         float = 0.94,
+        threshold:         float = 0.80,
         entry_price:       float = 0.92,
         size_usdc:         float = 50.0,
     ) -> None:

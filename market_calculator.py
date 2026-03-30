@@ -45,17 +45,17 @@ WINDOW_SEC = Config.MARKET_WINDOW_SEC  # 300
 #   σ_rem = σ₅ × √(ENTRY_WINDOW_SEC / WINDOW_SEC)
 #         = 0.22% × √(10/300) = 0.040%
 #
-#   For p=0.94 to equal true P at entry:
-#     k_exact  = logit(0.94) / (Φ⁻¹(0.94) × σ_rem) = 2.75 / (1.555×0.040%) ≈ 4 421
+#   For p=0.80 to equal true P at entry:
+#     k_exact  = logit(0.80) / (Φ⁻¹(0.80) × σ_rem) = 1.386 / (0.842×0.040%) ≈ 4 115
 #
 #   k_safe = 2 000 chosen for robustness up to σ₅=0.50% (high-vol day).
 #   VOLATILITY_GATE_BPS=200 blocks windows where σ₅ > 0.70%,
 #   ensuring positive EV (actual P > break-even 0.92) across all traded windows.
 #
-#   Win rates with k=2000, threshold=0.94:
-#     σ₅ = 0.22% → P = 99.97%  (typical day)
-#     σ₅ = 0.50% → P = 93.6%   (high-vol,  EV > 0)
-#     σ₅ > 0.70% → not traded  (VOLATILITY_GATE blocks)
+#   Win rates with k=2000, threshold=0.80:
+#     σ₅ = 0.22% → P ≈ 97%   (typical day, strong EV)
+#     σ₅ = 0.50% → P ≈ 88%   (high-vol, marginal EV)
+#     σ₅ > 0.70% → not traded (VOLATILITY_GATE blocks)
 K_SIGNAL_DEFAULT: float = 2000.0
 
 # Clamp bounds for adaptive K
@@ -176,7 +176,7 @@ class MarketCalculator:
         if sigma_remaining <= 0:
             return K_SIGNAL_DEFAULT
 
-        threshold = 0.94  # P_UP_THRESHOLD
+        threshold = 0.80  # P_UP_THRESHOLD
         logit_t = math.log(threshold / (1.0 - threshold))
         phi_inv_t = _phi_inv(threshold)
 
