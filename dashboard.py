@@ -126,7 +126,10 @@ HTML_PAGE = """\
     <h2>Signal (P up)</h2>
     <div class="metric" id="p-up">--</div>
     <div class="signal-bar"><div class="signal-fill" id="signal-fill" style="width:50%;background:#58a6ff;"></div></div>
-    <div class="sub" style="margin-top:6px;">Fair YES: <span id="fair-yes">--</span> | NO: <span id="fair-no">--</span></div>
+    <div class="sub" style="margin-top:6px;">
+      Fair YES: <span id="fair-yes">--</span> | NO: <span id="fair-no">--</span><br>
+      Confidence: <span id="signal-conf">--</span> | Raw: <span id="signal-raw">--</span>
+    </div>
   </div>
 
   <!-- Window -->
@@ -140,8 +143,8 @@ HTML_PAGE = """\
   <div class="card">
     <h2>Active Orders</h2>
     <div id="orders-display" style="margin-top:4px;">
-      <div class="metric-sm">YES: <span id="order-yes">--</span></div>
-      <div class="metric-sm">NO: <span id="order-no">--</span></div>
+      <div class="metric-sm">YES: <span id="order-yes">--</span> <span id="yes-ev" class="sub"></span></div>
+      <div class="metric-sm">NO: <span id="order-no">--</span> <span id="no-ev" class="sub"></span></div>
     </div>
     <div class="sub" style="margin-top:8px;">Market ask — YES: <span id="mkt-yes-ask">--</span> | NO: <span id="mkt-no-ask">--</span></div>
   </div>
@@ -161,13 +164,32 @@ HTML_PAGE = """\
   </div>
 </div>
 
+<!-- Advanced metrics row -->
+<div class="grid">
+  <!-- Risk Metrics -->
+  <div class="card">
+    <h2>Risk Metrics</h2>
+    <div class="metric-sm">Sharpe: <span id="sharpe">--</span></div>
+    <div class="metric-sm">Max Drawdown: <span id="max-dd" class="pnl-neg">--</span></div>
+    <div class="metric-sm">Profit Factor: <span id="pf">--</span></div>
+    <div class="sub">Consec. losses: <span id="consec-loss">0</span> | Streaks: <span class="win" id="max-wstreak">0</span>W / <span class="loss" id="max-lstreak">0</span>L</div>
+  </div>
+
+  <!-- Signal Factors -->
+  <div class="card">
+    <h2>Signal Factors</h2>
+    <div id="factors-display" class="sub" style="line-height:1.6;">No data yet</div>
+    <div class="sub" style="margin-top:6px;">Tick momentum: <span id="tick-mom">--</span> | Vol regime: <span id="vol-regime">--</span></div>
+  </div>
+</div>
+
 <!-- Recent trades -->
 <div class="card">
   <h2>Recent Trades</h2>
   <table>
-    <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Signal</th><th>Result</th><th>P&L</th></tr></thead>
+    <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Signal</th><th>Conf</th><th>Result</th><th>Exit</th><th>P&L</th></tr></thead>
     <tbody id="trades-body">
-      <tr><td colspan="6" style="color:#484f58;">No trades yet</td></tr>
+      <tr><td colspan="8" style="color:#484f58;">No trades yet</td></tr>
     </tbody>
   </table>
 </div>
@@ -183,12 +205,16 @@ function fmtUsd(n) { return n != null ? '$' + n.toLocaleString('en-US', {minimum
 const phaseColors = {
   'quoting': 'badge-green', 'waiting': 'badge-blue',
   'entry': 'badge-yellow', 'exit': 'badge-red',
-  'vol_skip': 'badge-red', 'initializing': 'badge-blue'
+  'vol_skip': 'badge-red', 'initializing': 'badge-blue',
+  'low_conf': 'badge-yellow', 'weak_signal': 'badge-yellow',
+  'stopped': 'badge-red',
 };
 const phaseLabels = {
   'quoting': 'QUOTING', 'waiting': 'WAITING',
   'entry': 'ENTRY WINDOW', 'exit': 'EXIT WINDOW',
-  'vol_skip': 'VOL SKIP', 'initializing': 'INIT'
+  'vol_skip': 'VOL SKIP', 'initializing': 'INIT',
+  'low_conf': 'LOW CONF', 'weak_signal': 'WEAK SIGNAL',
+  'stopped': 'STOPPED OUT',
 };
 
 async function refresh() {
@@ -232,6 +258,8 @@ async function refresh() {
     fill.style.background = pPct > 94 ? '#40c057' : pPct < 6 ? '#ff6b6b' : '#58a6ff';
     $('fair-yes').textContent = fmt(d.fair_yes, 4);
     $('fair-no').textContent = fmt(d.fair_no, 4);
+    $('signal-conf').textContent = fmt(d.signal_confidence * 100, 1) + '%';
+    $('signal-raw').textContent = fmt(d.signal_raw_p_up * 100, 1) + '%';
 
     // Window
     $('countdown').textContent = fmt(d.seconds_to_close, 0) + 's';
@@ -246,6 +274,10 @@ async function refresh() {
     $('order-yes').style.color = d.yes_order_active ? '#40c057' : '#484f58';
     $('order-no').textContent = d.no_order_active ? fmt(d.no_order_price, 4) : 'none';
     $('order-no').style.color = d.no_order_active ? '#40c057' : '#484f58';
+    $('yes-ev').textContent = d.yes_ev != null ? '(EV: ' + (d.yes_ev >= 0 ? '+' : '') + fmt(d.yes_ev, 2) + ')' : '';
+    $('yes-ev').style.color = d.yes_ev >= 0 ? '#40c057' : '#ff6b6b';
+    $('no-ev').textContent = d.no_ev != null ? '(EV: ' + (d.no_ev >= 0 ? '+' : '') + fmt(d.no_ev, 2) + ')' : '';
+    $('no-ev').style.color = d.no_ev >= 0 ? '#40c057' : '#ff6b6b';
     $('mkt-yes-ask').textContent = d.market_yes_ask != null ? fmt(d.market_yes_ask, 4) : '--';
     $('mkt-no-ask').textContent = d.market_no_ask != null ? fmt(d.market_no_ask, 4) : '--';
 
@@ -261,6 +293,28 @@ async function refresh() {
     $('losses').textContent = d.losses;
     $('rolling-wr').textContent = d.total_trades > 0 ? fmt(d.rolling_win_rate, 1) + '%' : '--';
 
+    // Risk metrics
+    $('sharpe').textContent = d.sharpe_ratio != null ? fmt(d.sharpe_ratio, 2) : '--';
+    const ddEl = $('max-dd');
+    ddEl.textContent = fmt(d.max_drawdown, 2) + ' USDC';
+    ddEl.className = d.max_drawdown < 0 ? 'pnl-neg' : '';
+    $('pf').textContent = d.profit_factor != null ? fmt(d.profit_factor, 2) : '--';
+    $('consec-loss').textContent = d.consecutive_losses;
+    $('max-wstreak').textContent = d.max_win_streak;
+    $('max-lstreak').textContent = d.max_loss_streak;
+
+    // Signal factors
+    if (d.signal_factors && Object.keys(d.signal_factors).length > 0) {
+      const lines = Object.entries(d.signal_factors).map(([k, v]) => {
+        const pct = (v * 100).toFixed(1);
+        const color = v > 0.55 ? '#40c057' : v < 0.45 ? '#ff6b6b' : '#8b949e';
+        return `<span style="color:${color}">${k}: ${pct}%</span>`;
+      });
+      $('factors-display').innerHTML = lines.join(' &nbsp;|&nbsp; ');
+    }
+    $('tick-mom').textContent = fmt(d.tick_momentum, 3);
+    $('vol-regime').textContent = d.vol_regime || '--';
+
     // Trades table
     const tbody = $('trades-body');
     if (d.recent_trades && d.recent_trades.length > 0) {
@@ -268,9 +322,11 @@ async function refresh() {
         const tm = new Date(t.time * 1000).toLocaleTimeString();
         const cls = t.result === 'WIN' ? 'win' : 'loss';
         const pnlCls = t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        const exitLabel = t.exit_type === 'stop-loss' ? 'SL' : 'BIN';
         return `<tr>
           <td>${tm}</td><td>${t.side}</td><td>${fmt(t.price,4)}</td>
-          <td>${t.signal}%</td><td class="${cls}">${t.result}</td>
+          <td>${t.signal}%</td><td>${fmt(t.confidence*100,0)}%</td>
+          <td class="${cls}">${t.result}</td><td>${exitLabel}</td>
           <td class="${pnlCls}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl,2)}</td>
         </tr>`;
       }).join('');

@@ -37,7 +37,7 @@ from typing import Optional
 
 from bot_state import state as dashboard_state, TradeSnapshot
 from config import Config
-from market_calculator import BtcMarket, MarketCalculator, compute_fee_per_share, compute_fee
+from market_calculator import BtcMarket, MarketCalculator, SignalResult, compute_fee_per_share, compute_fee
 from polymarket_client import MakerOrder, PolymarketClient, SIDE_BUY, SIDE_SELL
 from stats import BotStats
 from trade_logger import TradeLogger, TradeRow
@@ -238,37 +238,37 @@ class MarketMaker:
         # --- Determine phase ---
         stc = market.seconds_to_close
         if stc <= Config.EXIT_WINDOW_SEC:
-            phase = "exit"
-        else:
-            phase = "quoting"
-
-        self._update_dashboard(market, state, phase)
-
-        if phase == "exit":
+            self._update_dashboard(market, state, "exit")
             await self._cancel_window(state)
             return
 
+        # _quote_both_sides updates dashboard with accurate phase
         await self._quote_both_sides(state, market)
 
     def _check_circuit_breaker(self) -> bool:
-        """Stop trading if session P&L drops below -MAX_LOSS_USDC."""
-        if self._stats.total_pnl < -Config.MAX_LOSS_USDC:
+        """Stop trading if drawdown from peak exceeds MAX_LOSS_USDC."""
+        drawdown = abs(self._stats.current_drawdown)
+        if drawdown > Config.MAX_LOSS_USDC:
             if not self._circuit_open:
                 self._circuit_open = True
                 log.warning(
-                    "CIRCUIT BREAKER | session P&L=%.2f < -%.2f — quoting stopped",
-                    self._stats.total_pnl, Config.MAX_LOSS_USDC,
+                    "CIRCUIT BREAKER | drawdown=%.2f > limit=%.2f | P&L=%.2f — quoting stopped",
+                    drawdown, Config.MAX_LOSS_USDC, self._stats.total_pnl,
                 )
             return True
         if self._circuit_open:
             self._circuit_open = False
-            log.info("Circuit breaker reset | P&L=%.2f", self._stats.total_pnl)
+            log.info("Circuit breaker reset | drawdown=%.2f | P&L=%.2f",
+                     drawdown, self._stats.total_pnl)
         return False
 
-    def _update_dashboard(self, market: BtcMarket, state: WindowState, phase: str) -> None:
+    def _update_dashboard(self, market: BtcMarket, state: WindowState,
+                          phase: str, signal: Optional[SignalResult] = None) -> None:
         """Push current state to the shared dashboard object."""
         mid = self._ob_ws.book.mid_price or 0.0
-        p_up = self._calc.p_up_signal(market)
+        if signal is None:
+            signal = self._calc.compute_signal(market)
+        p_up = signal.p_up
         spread = self._calc.dynamic_spread(market)
 
         ds = dashboard_state
@@ -288,6 +288,28 @@ class MarketMaker:
         ds.obi = self._ob_ws.smoothed_obi
         ds.vol_regime = self._ob_ws.vol_regime
         ds.volume_ratio = self._ob_ws.volume_ratio
+
+        # Signal quality fields
+        ds.signal_confidence = signal.confidence
+        ds.signal_raw_p_up = signal.raw_p_up
+        ds.signal_factors = signal.factors
+
+        # Tick momentum
+        ds.tick_momentum = getattr(self._ob_ws, 'tick_momentum', 0.0)
+
+        # EV per side
+        yes_bid = state.yes.order.price if state.yes.order else (p_up - spread)
+        no_bid = state.no.order.price if state.no.order else ((1.0 - p_up) - spread)
+        ds.yes_ev = self._calc.expected_value(p_up, max(0.05, yes_bid), Config.ORDER_SIZE_USDC)
+        ds.no_ev = self._calc.expected_value(1.0 - p_up, max(0.05, no_bid), Config.ORDER_SIZE_USDC)
+
+        # Advanced stats
+        ds.sharpe_ratio = self._stats.sharpe_ratio
+        ds.max_drawdown = self._stats.max_drawdown
+        ds.profit_factor = self._stats.profit_factor
+        ds.consecutive_losses = self._stats.consecutive_losses
+        ds.max_win_streak = self._stats._max_win_streak
+        ds.max_loss_streak = self._stats._max_loss_streak
 
         # Hedge timeout status
         hedge_active = False
@@ -352,12 +374,14 @@ class MarketMaker:
 
         Pricing pipeline:
         1. Time-weighted entry: skip if in quiet period or signal too weak
-        2. Compute fair prices from signal model
-        3. Compute dynamic spread (time-based) + fee adjustment for live mode
-        4. Apply inventory skew if one side already filled
-        5. Adjust bids using real CLOB ask (orderbook-aware pricing)
-        6. Compute Kelly-optimal order sizes
-        7. Enforce bid_yes + bid_no < 1.0 invariant
+        2. Compute fair prices from full signal model (with confidence)
+        3. Gate on confidence and EV thresholds
+        4. Compute dynamic spread + fee adjustment (both modes)
+        5. Apply inventory skew if one side already filled
+        6. Adjust bids using real CLOB ask (orderbook-aware pricing)
+        7. Compute Kelly-optimal order sizes with drawdown/streak reduction
+        8. Enforce bid_yes + bid_no < 1.0 invariant
+        9. Enforce per-window loss cap
 
         If both fill, total cost < $1 → guaranteed profit.
         """
@@ -372,6 +396,7 @@ class MarketMaker:
                     candle_vol, Config.VOLATILITY_GATE_BPS,
                 )
             await self._cancel_window(state)
+            self._update_dashboard(market, state, "vol_skip")
             return
 
         stc = market.seconds_to_close
@@ -379,15 +404,26 @@ class MarketMaker:
 
         # --- Window stopped out by stop-loss — no further quoting ---
         if state.stopped_out:
+            self._update_dashboard(market, state, "stopped")
             return
 
         # --- Time-weighted entry: skip quiet period early in window ---
         if elapsed < Config.QUIET_PERIOD_SEC:
+            self._update_dashboard(market, state, "waiting")
             return
 
-        # --- Fair prices and base spread ---
-        fair_yes, fair_no = self._calc.fair_prices(market)
-        p_up = fair_yes
+        # --- Full signal computation (with confidence and factors) ---
+        signal = self._calc.compute_signal(market)
+        p_up = signal.p_up
+        fair_yes = p_up
+        fair_no = 1.0 - p_up
+
+        # --- Confidence gate ---
+        if signal.confidence < Config.MIN_CONFIDENCE:
+            if state.yes.has_order or state.no.has_order:
+                await self._cancel_window(state)
+            self._update_dashboard(market, state, "low_conf", signal)
+            return
 
         # --- Adaptive stop-loss: threshold = f(σ, stc) ---
         if Config.STOP_LOSS_ENABLED and stc > Config.STOP_LOSS_MIN_STC:
@@ -408,9 +444,9 @@ class MarketMaker:
 
         # --- Minimum signal edge filter ---
         if abs(p_up - 0.5) < Config.MIN_SIGNAL_EDGE:
-            # Signal too close to 50/50 — cancel existing orders, don't quote
             if state.yes.has_order or state.no.has_order:
                 await self._cancel_window(state)
+            self._update_dashboard(market, state, "weak_signal", signal)
             return
 
         base_spread = self._calc.dynamic_spread(market)
@@ -468,14 +504,11 @@ class MarketMaker:
         )
 
         # --- Fee-aware spread: widen bids to cover exact Polymarket fee ---
-        # Instead of a fixed 1.5¢ constant, compute the actual fee per share
-        # at each bid price.  This adds more spread where fees are high (p≈0.50)
-        # and almost nothing where fees are negligible (p≈0.90+).
-        if not self._is_paper:
-            yes_fee_adj = compute_fee_per_share(yes_bid)
-            no_fee_adj  = compute_fee_per_share(no_bid)
-            yes_bid = round(yes_bid - yes_fee_adj, 2)
-            no_bid  = round(no_bid  - no_fee_adj, 2)
+        # Applied in BOTH paper and live mode for consistent simulation.
+        yes_fee_adj = compute_fee_per_share(yes_bid)
+        no_fee_adj  = compute_fee_per_share(no_bid)
+        yes_bid = round(yes_bid - yes_fee_adj, 2)
+        no_bid  = round(no_bid  - no_fee_adj, 2)
 
         # Cap at MAX_ENTRY_PRICE
         yes_bid = min(yes_bid, Config.MAX_ENTRY_PRICE)
@@ -493,14 +526,44 @@ class MarketMaker:
             yes_bid = round(yes_bid * scale, 2)
             no_bid  = round(no_bid  * scale, 2)
 
-        # --- Kelly sizing ---
-        yes_size = self._calc.kelly_size(p_up, yes_bid, Config.ORDER_SIZE_USDC)
-        no_size  = self._calc.kelly_size(1.0 - p_up, no_bid, Config.ORDER_SIZE_USDC)
+        # --- EV filter: reject trades with marginal expected value ---
+        yes_ev = self._calc.expected_value(p_up, yes_bid, Config.ORDER_SIZE_USDC)
+        no_ev = self._calc.expected_value(1.0 - p_up, no_bid, Config.ORDER_SIZE_USDC)
+
+        # --- Kelly sizing (confidence-adjusted) ---
+        yes_size = self._calc.kelly_size(p_up, yes_bid, Config.ORDER_SIZE_USDC, signal.confidence)
+        no_size  = self._calc.kelly_size(1.0 - p_up, no_bid, Config.ORDER_SIZE_USDC, signal.confidence)
 
         # --- Vol regime size reduction ---
         if vol_regime == "storm":
             yes_size *= Config.VOL_REGIME_STORM_SIZE_MULT
             no_size *= Config.VOL_REGIME_STORM_SIZE_MULT
+
+        # --- Drawdown-based size reduction ---
+        if Config.DRAWDOWN_SIZE_REDUCTION:
+            dd = abs(self._stats.current_drawdown)
+            if dd > 0:
+                dd_mult = max(
+                    Config.DRAWDOWN_MIN_SIZE_MULT,
+                    1.0 - 0.5 * (dd / Config.DRAWDOWN_FULL_REDUCE_USDC),
+                )
+                yes_size *= dd_mult
+                no_size *= dd_mult
+
+        # --- Consecutive loss size reduction ---
+        if self._stats.consecutive_losses >= Config.CONSEC_LOSS_REDUCE_AFTER:
+            yes_size *= Config.CONSEC_LOSS_SIZE_MULT
+            no_size *= Config.CONSEC_LOSS_SIZE_MULT
+
+        # --- Per-window loss cap ---
+        window_exposure = 0.0
+        if state.yes.was_ever_filled:
+            window_exposure += state.yes.last_entry_size
+        if state.no.was_ever_filled:
+            window_exposure += state.no.last_entry_size
+        remaining_budget = max(0.0, Config.MAX_LOSS_PER_WINDOW_USDC - window_exposure)
+        yes_size = min(yes_size, remaining_budget)
+        no_size = min(no_size, remaining_budget)
 
         # --- Periodic log ---
         now = time.monotonic()
@@ -521,26 +584,28 @@ class MarketMaker:
                 else:
                     skew_label = " [skew→YES]"
             log.info(
-                "Quoting | BTC=%.2f  p_up=%.4f  σ=%.4f  spread=%.4f  "
-                "yes=%.2f($%.0f)  no=%.2f($%.0f)  sum=%.2f  "
+                "Quoting | BTC=%.2f  p_up=%.4f  conf=%.2f  σ=%.4f  spread=%.4f  "
+                "yes=%.2f($%.0f ev=%.2f)  no=%.2f($%.0f ev=%.2f)  sum=%.2f  "
                 "mkt_ask_y=%s  mkt_ask_n=%s  vol=%.0fbps  stc=%.0fs  regime=%s%s",
-                self._ob_ws.book.mid_price or 0, p_up, sigma, base_spread,
-                yes_bid, yes_size, no_bid, no_size, yes_bid + no_bid,
+                self._ob_ws.book.mid_price or 0, p_up, signal.confidence, sigma, base_spread,
+                yes_bid, yes_size, yes_ev, no_bid, no_size, no_ev, yes_bid + no_bid,
                 f"{self._last_yes_ask:.2f}" if self._last_yes_ask else "?",
                 f"{self._last_no_ask:.2f}" if self._last_no_ask else "?",
                 candle_vol, stc, vol_regime, skew_label,
             )
 
         # --- Signal direction filter ---
-        # Don't place orders on the side the signal says will lose.
-        # When p_up > 0.5: YES is favoured, skip NO unless close to 50/50.
-        # When p_up < 0.5: NO is favoured, skip YES unless close to 50/50.
-        # Both sides only when signal is within ±HEDGE_BAND of 0.5.
-        HEDGE_BAND = 0.10  # place both when p_up in [0.40, 0.60]
-        place_yes = p_up >= (0.5 - HEDGE_BAND)  # skip YES only when p_up < 0.40
-        place_no  = p_up <= (0.5 + HEDGE_BAND)  # skip NO  only when p_up > 0.60
+        HEDGE_BAND = 0.10
+        place_yes = p_up >= (0.5 - HEDGE_BAND)
+        place_no  = p_up <= (0.5 + HEDGE_BAND)
 
-        min_bid = Config.MIN_BID_PRICE  # default 0.05 — bids below this never fill
+        # --- EV gate: don't place if EV below threshold ---
+        if yes_ev < Config.MIN_EV_USDC:
+            place_yes = False
+        if no_ev < Config.MIN_EV_USDC:
+            place_no = False
+
+        min_bid = Config.MIN_BID_PRICE
 
         # --- Place/refresh orders on both sides ---
         tasks = []
@@ -555,9 +620,6 @@ class MarketMaker:
                 if not state.yes.was_ever_active:
                     state.yes.p_signal_at_entry = p_up
                     state.yes.was_ever_active = True
-                    if not self._is_paper:
-                        state.yes.was_ever_filled = True
-                        state.yes.first_fill_time = time.monotonic()
                 state.yes.last_entry_price = yes_bid
                 state.yes.last_entry_size = yes_size
                 tasks.append(self._refresh_side(state.yes, yes_bid, yes_size))
@@ -575,9 +637,6 @@ class MarketMaker:
                 if not state.no.was_ever_active:
                     state.no.p_signal_at_entry = p_up
                     state.no.was_ever_active = True
-                    if not self._is_paper:
-                        state.no.was_ever_filled = True
-                        state.no.first_fill_time = time.monotonic()
                 state.no.last_entry_price = no_bid
                 state.no.last_entry_size = no_size
                 tasks.append(self._refresh_side(state.no, no_bid, no_size))
@@ -586,6 +645,8 @@ class MarketMaker:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._update_dashboard(market, state, "quoting", signal)
 
     # ------------------------------------------------------------------
     # CLOB orderbook polling (background)
@@ -624,10 +685,8 @@ class MarketMaker:
 
     def _check_paper_fills(self, state: WindowState) -> None:
         """
-        In paper mode, check if our resting orders would have filled.
-        A BUY order fills if the Polymarket market ask <= our bid price.
-        Fill price = min(our_bid, market_ask) — same as real limit orders
-        (we get price improvement when ask < bid).
+        In paper mode, use PaperClient.check_fill() for realistic fill simulation
+        with slippage, latency, and partial fills.
         """
         for side, ask in [
             (state.yes, self._last_yes_ask),
@@ -635,15 +694,19 @@ class MarketMaker:
         ]:
             if side.was_ever_filled or not side.has_order or ask is None:
                 continue
-            if side.order.price >= ask:
-                # Fill at market ask (price improvement), not at our bid
-                fill_price = min(side.order.price, ask)
+            fill_info = self._client.check_fill(side.order, ask)
+            if fill_info is not None:
                 side.was_ever_filled = True
                 side.first_fill_time = time.monotonic()
-                side.last_entry_price = fill_price
+                side.last_entry_price = fill_info["fill_price"]
+                side.last_entry_size = fill_info["fill_size_usdc"]
                 log.info(
-                    "Paper FILL | %s @ %.4f (bid=%.4f, market ask=%.4f)",
-                    side.side_label, fill_price, side.order.price, ask,
+                    "Paper FILL | %s @ %.4f (bid=%.4f, ask=%.4f) | "
+                    "slip=%.1fbps lat=%.0fms fill=%.0f%%",
+                    side.side_label, fill_info["fill_price"],
+                    side.order.price, ask,
+                    fill_info["slippage_bps"], fill_info["latency_ms"],
+                    fill_info["fill_fraction"] * 100,
                 )
 
     # ------------------------------------------------------------------
@@ -662,13 +725,14 @@ class MarketMaker:
         entry_price = side.last_entry_price
         size_usdc = side.last_entry_size
         shares = size_usdc / entry_price
-        pnl = shares * (current_fair - entry_price)
+        fee = compute_fee(shares, entry_price)
+        pnl = shares * (current_fair - entry_price) - fee
 
         log.warning(
             "STOP-LOSS | %s filled@%.2f → fair=%.2f | reversal=%.2f | "
-            "shares=%.1f | P&L=%.2f USDC",
+            "shares=%.1f | fee=%.4f | P&L=%.2f USDC",
             side.side_label, entry_price, current_fair,
-            entry_price - current_fair, shares, pnl,
+            entry_price - current_fair, shares, fee, pnl,
         )
 
         # Cancel all orders for this window
@@ -683,6 +747,7 @@ class MarketMaker:
             p_signal=side.p_signal_at_entry,
             won=False,
             pnl_override=pnl,
+            fee=fee,
         )
 
         # Paper mode: adjust balance
@@ -701,6 +766,7 @@ class MarketMaker:
             p_signal=side.p_signal_at_entry,
             won=False,
             pnl=pnl,
+            exit_type="stop-loss",
         ))
         if len(dashboard_state.recent_trades) > 50:
             dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
@@ -793,7 +859,7 @@ class MarketMaker:
         Approximate trade outcome for the closing window and record it.
 
         Only resolves sides where was_ever_filled is True:
-        - Live mode: filled = True when order placed (optimistic)
+        - Live mode: filled = True when CLOB confirms
         - Paper mode: filled = True only when CLOB ask <= our bid
         """
         market = state.market
@@ -815,6 +881,10 @@ class MarketMaker:
             shares = size_usdc / entry_price
             fee = compute_fee(shares, entry_price)
 
+            # Compute signal confidence at evaluation time (for record)
+            sig = self._calc.compute_signal(market)
+            conf = sig.confidence
+
             self._stats.record_trade(
                 window_start=market.window_start,
                 side=side.side_label,
@@ -823,6 +893,7 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
                 fee=fee,
+                confidence=conf,
             )
             if hasattr(self._client, 'resolve_trade'):
                 self._client.resolve_trade(won, size_usdc, entry_price)
@@ -867,6 +938,8 @@ class MarketMaker:
                 p_signal=side.p_signal_at_entry,
                 won=won,
                 pnl=pnl,
+                confidence=conf,
+                exit_type="binary",
             ))
             if len(dashboard_state.recent_trades) > 50:
                 dashboard_state.recent_trades = dashboard_state.recent_trades[-50:]
