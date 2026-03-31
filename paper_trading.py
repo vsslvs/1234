@@ -15,12 +15,8 @@ import logging
 import random
 import time
 import uuid
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-import aiohttp
-
-from config import Config
 from polymarket_client import MakerOrder
 
 log = logging.getLogger(__name__)
@@ -31,50 +27,18 @@ class PaperClient:
     Mock order executor that simulates fills locally.
 
     All orders are filled immediately at the requested price (optimistic model).
-    Fee rates are fetched from the real API for accuracy.
     """
 
     def __init__(self):
         self._open_orders: Dict[str, MakerOrder] = {}
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._fee_cache: Dict[str, int] = {}
         self._total_placed: int = 0
         self._total_cancelled: int = 0
 
     async def __aenter__(self):
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5)
-        )
         return self
 
     async def __aexit__(self, *_):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # ------------------------------------------------------------------
-    # Fee rates — fetch from real API for accuracy
-    # ------------------------------------------------------------------
-
-    async def get_fee_rate(self, token_id: str) -> int:
-        """Return cached fee rate or fetch from Polymarket."""
-        if token_id in self._fee_cache:
-            return self._fee_cache[token_id]
-
-        try:
-            async with self._session.get(
-                f"{Config.CLOB_API_URL}/fee-rate",
-                params={"tokenID": token_id},
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    bps = int(data.get("feeRateBps", 0))
-                    self._fee_cache[token_id] = bps
-                    return bps
-        except Exception:
-            pass
-
-        # Default if API unavailable
-        return 0
+        pass
 
     # ------------------------------------------------------------------
     # Order placement (simulated)
@@ -83,24 +47,23 @@ class PaperClient:
     async def place_maker_order(
         self,
         token_id: str,
-        side: int,
+        side: str,
         price: float,
         size_usdc: float,
     ) -> MakerOrder:
         """Simulate placing a maker order — fills immediately."""
-        # Simulate latency
         await asyncio.sleep(random.uniform(0.005, 0.025))
 
         order_id = f"paper-{uuid.uuid4().hex[:12]}"
-        fee_rate = await self.get_fee_rate(token_id)
+        size_shares = size_usdc / price if price > 0 else 0
 
         order = MakerOrder(
             order_id=order_id,
             token_id=token_id,
             side=side,
             price=price,
+            size=size_shares,
             size_usdc=size_usdc,
-            fee_rate_bps=fee_rate,
             placed_at=time.monotonic(),
         )
 
@@ -108,9 +71,8 @@ class PaperClient:
         self._total_placed += 1
 
         log.info(
-            "[PAPER] Placed %s order id=%s price=%.4f size=%.2f",
-            "BUY" if side == 0 else "SELL",
-            order_id, price, size_usdc,
+            "[PAPER] Placed %s order id=%s price=%.4f size=%.2f USDC",
+            side, order_id, price, size_usdc,
         )
         return order
 
@@ -137,7 +99,7 @@ class PaperClient:
         new_price: float,
         new_size_usdc: Optional[float] = None,
     ) -> Optional[MakerOrder]:
-        """Simulate cancel + replace — fire concurrently like the real client."""
+        """Simulate cancel + replace."""
         size = new_size_usdc if new_size_usdc is not None else old_order.size_usdc
 
         cancel_coro = self.cancel_order(old_order.order_id)
@@ -180,7 +142,7 @@ class PaperClient:
             log.info("[PAPER] Cancelled %d open orders on shutdown", count)
 
     async def check_approvals(self) -> None:
-        """No-op for paper trading — approvals not needed."""
+        """No-op for paper trading."""
         log.info("[PAPER] Approval check skipped (paper mode)")
 
     def summary(self) -> dict:

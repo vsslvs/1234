@@ -131,6 +131,7 @@ class MarketMaker:
         self._windows_since_stats_log = 0
         self._last_state_push: float = 0.0
         self._last_reconcile: float = 0.0
+        self._last_no_market_warn: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -175,6 +176,10 @@ class MarketMaker:
     async def _tick(self) -> None:
         market = self._calc.current_market()
         if market is None:
+            now = time.monotonic()
+            if now - self._last_no_market_warn > 60:
+                log.warning("No market found for current 5-minute window — waiting")
+                self._last_no_market_warn = now
             return
 
         # Roll over state when window changes
@@ -513,14 +518,28 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self) -> None:
-        # Sleep FIRST so the initial fetch in run() is not immediately duplicated.
+        """Refresh market list periodically.
+
+        Normal interval: 600s (10 min), covers 30 min lookahead.
+        On failure: retry every 30s until successful.
+        """
         while self._running:
             await asyncio.sleep(600)
             if self._running:
                 await self._refresh_market_list()
 
     async def _refresh_market_list(self) -> None:
-        markets = await self._calc.fetch_upcoming_markets()
+        try:
+            markets = await self._calc.fetch_upcoming_markets()
+        except Exception as exc:
+            log.error("Market refresh failed: %s — retrying in 30s", exc)
+            await asyncio.sleep(30)
+            try:
+                markets = await self._calc.fetch_upcoming_markets()
+            except Exception:
+                log.error("Market refresh retry also failed")
+                return
+
         if not markets:
             log.warning("No BTC 5m markets found — will retry on next refresh cycle")
         else:

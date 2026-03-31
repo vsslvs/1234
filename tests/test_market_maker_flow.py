@@ -73,8 +73,8 @@ class TestMarketSide:
         from polymarket_client import MakerOrder
         side = MarketSide("tok", "YES")
         side.order = MakerOrder(
-            order_id="o1", token_id="tok", side=0,
-            price=0.92, size_usdc=50, fee_rate_bps=0,
+            order_id="o1", token_id="tok", side="BUY",
+            price=0.92, size=54.35, size_usdc=50,
             placed_at=time.monotonic(),
         )
         assert not side.price_drifted(0.922)  # 0.002 < threshold 0.005
@@ -83,8 +83,8 @@ class TestMarketSide:
         from polymarket_client import MakerOrder
         side = MarketSide("tok", "YES")
         side.order = MakerOrder(
-            order_id="o1", token_id="tok", side=0,
-            price=0.92, size_usdc=50, fee_rate_bps=0,
+            order_id="o1", token_id="tok", side="BUY",
+            price=0.92, size=54.35, size_usdc=50,
             placed_at=time.monotonic(),
         )
         assert side.price_drifted(0.93)  # 0.01 > threshold 0.005

@@ -93,6 +93,11 @@ class Config:
     # Paper trading mode
     PAPER_MODE: bool = _get_bool("PAPER_MODE", "false")
 
+    # CLOB API credentials (optional — auto-derived from wallet if not set)
+    CLOB_API_KEY: str = _get("CLOB_API_KEY", "")
+    CLOB_API_SECRET: str = _get("CLOB_API_SECRET", "")
+    CLOB_API_PASSPHRASE: str = _get("CLOB_API_PASSPHRASE", "")
+
     # Logging format: "text" or "json"
     LOG_FORMAT: str = _get("LOG_FORMAT", "text")
 

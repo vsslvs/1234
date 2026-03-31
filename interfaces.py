@@ -13,7 +13,7 @@ class MakerOrderInfo:
     """Minimal order info shared across live and paper implementations."""
     order_id: str
     token_id: str
-    side: int
+    side: str       # "BUY" or "SELL"
     price: float
     size_usdc: float
 
@@ -23,7 +23,7 @@ class OrderExecutor(Protocol):
     """Interface for order placement — live or paper."""
 
     async def place_maker_order(
-        self, token_id: str, side: int, price: float, size_usdc: float,
+        self, token_id: str, side: str, price: float, size_usdc: float,
     ) -> "MakerOrderInfo": ...
 
     async def cancel_order(self, order_id: str) -> bool: ...
